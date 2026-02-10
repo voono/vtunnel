@@ -66,7 +66,7 @@ function install_binary() {
     echo -e "${YELLOW}[*] Downloading latest release from GitHub...${NC}"
 
     # دریافت آخرین لینک دانلود (فرض بر این است که نام فایل‌ها استاندارد است)
-    DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/latest/download/${BINARY_NAME}-${FILE_SUFFIX}"
+    DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/latest/${BINARY_NAME}-${FILE_SUFFIX}"
     
     # اگر فایل وجود دارد بکاپ بگیر
     if [ -f "$INSTALL_DIR/$BINARY_NAME" ]; then
