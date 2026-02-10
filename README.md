@@ -22,31 +22,18 @@ It works by encapsulating traffic into **FakeTCP** packets (using Raw Sockets) c
 
 ## 📦 Quick Installation (Recommended)
 
-We provide an automated Bash script to handle installation, `iptables` configuration, and systemd service creation.
+Install with one command (downloads and runs the installer script):
 
-1. **Download the script:**
-   ```bash
-   wget [https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/install.sh](https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/install.sh)
-
-```
-
-2. **Make it executable:**
 ```bash
-chmod +x install.sh
-
+bash <(curl -Ls https://raw.githubusercontent.com/voono/vtunnel/refs/heads/main/install.sh)
 ```
 
+Run with `sudo` if the script asks for root. Then follow the on-screen menu:
 
-3. **Run the manager:**
-```bash
-sudo ./install.sh
+- **1** — Install dependencies and core binary
+- **2** — Add a new Tunnel (Server or Client)
 
-```
-
-
-4. **Follow the on-screen instructions:**
-* Select **1** to install dependencies and core binary.
-* Select **2** to add a new Tunnel (Server or Client).
+The script handles installation, `iptables` setup, and systemd service creation.
 
 
 
@@ -60,8 +47,8 @@ If you prefer running the binary manually without the script.
 
 ```bash
 # Clone repo
-git clone [https://github.com/YOUR_USERNAME/YOUR_REPO.git](https://github.com/YOUR_USERNAME/YOUR_REPO.git)
-cd YOUR_REPO
+git clone https://github.com/voono/vtunnel.git
+cd vtunnel
 
 # Build for Linux
 env GOOS=linux GOARCH=amd64 go build -o vtunnel main.go

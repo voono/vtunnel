@@ -35,8 +35,12 @@ var bufPool = sync.Pool{
 
 func main() {
 	mode := flag.String("mode", "server", "Mode: 'server' or 'client'")
-	listen := flag.String("listen", ":1080", "SOCKS5 Listen Address (e.g. :1080)")
-	fwd := flag.String("fwd", "", "Port Forwarding: 'LocalPort:RemoteIP:RemotePort' (e.g. 8080:127.0.0.1:80)")
+	
+	// *** FIX: Default value changed from ":1080" to "" (Empty String) ***
+	// This ensures SOCKS doesn't start unless -listen is explicitly passed
+	listen := flag.String("listen", "", "SOCKS5 Listen Address (e.g. :1080)")
+	
+	fwd := flag.String("fwd", "", "Port Forwarding: 'LocalPort:RemoteIP:RemotePort'")
 	remote := flag.String("remote", "", "Server IP")
 	port := flag.Int("port", 443, "Tunnel Port")
 	key := flag.String("key", "secret", "Encryption key")
@@ -113,30 +117,26 @@ func handleMux(mux *smux.Session, socksServer *socks5.Server) {
 		go func(s *smux.Stream) {
 			defer s.Close()
 
-			// 1. خواندن هدر (طول آدرس مقصد)
 			lenBuf := make([]byte, 1)
 			if _, err := io.ReadFull(s, lenBuf); err != nil {
 				return
 			}
 			addrLen := int(lenBuf[0])
 
-			// 2. اگر طول 0 بود، یعنی SOCKS5 است
 			if addrLen == 0 {
 				socksServer.ServeConn(s)
 				return
 			}
 
-			// 3. اگر طول > 0 بود، یعنی Forwarding است. خواندن آدرس.
 			addrBuf := make([]byte, addrLen)
 			if _, err := io.ReadFull(s, addrBuf); err != nil {
 				return
 			}
 			targetAddr := string(addrBuf)
 
-			// 4. اتصال به مقصد نهایی
 			remoteConn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
 			if err != nil {
-				log.Printf("[Forward] Failed to dial %s: %v", targetAddr, err)
+				// log.Printf("[Forward] Failed to dial %s: %v", targetAddr, err)
 				return
 			}
 			defer remoteConn.Close()
@@ -178,7 +178,6 @@ func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.Bl
 	}
 	defer session.Close()
 
-	// Keep-Alive
 	go func() {
 		for {
 			time.Sleep(5 * time.Second)
@@ -188,24 +187,27 @@ func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.Bl
 		}
 	}()
 
-	// --- راه اندازی SOCKS5 Listener ---
+	// *** منطق جدید: فقط اگر آدرس خالی نباشد استارت می‌کند ***
 	if socksAddr != "" {
 		go startListener(socksAddr, "", session)
 	}
 
-	// --- راه اندازی Port Forwarding Listener ---
 	if fwdRule != "" {
-		parts := strings.SplitN(fwdRule, ":", 2)
-		if len(parts) == 2 {
-			localPort := parts[0]
-			targetAddr := parts[1] // شامل IP:Port مقصد
-			go startListener(":"+localPort, targetAddr, session)
-		} else {
-			log.Printf("[Error] Invalid fwd format. Use LocalPort:RemoteIP:RemotePort")
+		// پشتیبانی از چند پورت با ویرگول
+		// Format: 8080:1.1.1.1:80,9090:8.8.8.8:53
+		rules := strings.Split(fwdRule, ",")
+		for _, rule := range rules {
+			parts := strings.SplitN(rule, ":", 2)
+			if len(parts) == 2 {
+				localPort := parts[0]
+				targetAddr := parts[1]
+				go startListener(":"+localPort, targetAddr, session)
+			} else {
+				log.Printf("[Error] Invalid fwd rule: %s", rule)
+			}
 		}
 	}
 
-	// جلوگیری از بسته شدن برنامه
 	select {}
 }
 
@@ -234,15 +236,11 @@ func startListener(localAddr, targetAddr string, session *smux.Session) {
 				return
 			}
 
-			// --- پروتکل اختصاصی ما ---
 			if targetAddr == "" {
-				// حالت ساکس: ارسال بایت 0
 				p2.Write([]byte{0})
 			} else {
-				// حالت فوروارد: ارسال طول آدرس + خود آدرس
 				addrBytes := []byte(targetAddr)
 				if len(addrBytes) > 255 {
-					log.Println("Target address too long")
 					local.Close()
 					p2.Close()
 					return
@@ -260,13 +258,15 @@ func pipe(p1, p2 io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() { 
-		buf := make([]byte, 32*1024)
+		buf := bufPool.Get().([]byte)
+		defer bufPool.Put(buf)
 		io.CopyBuffer(p1, p2, buf)
 		p1.Close()
 		wg.Done() 
 	}()
 	go func() { 
-		buf := make([]byte, 32*1024)
+		buf := bufPool.Get().([]byte)
+		defer bufPool.Put(buf)
 		io.CopyBuffer(p2, p1, buf)
 		p2.Close()
 		wg.Done() 
@@ -275,7 +275,7 @@ func pipe(p1, p2 io.ReadWriteCloser) {
 }
 
 // ==========================================
-//       RAW SOCKET (SAME AS BEFORE)
+//       RAW SOCKET (NO CHANGE)
 // ==========================================
 
 type RawTCPConn struct {

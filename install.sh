@@ -100,7 +100,7 @@ function read_with_default() {
 function print_header() {
     clear
     echo -e "${CYAN}=================================================${NC}"
-    echo -e "${CYAN}               VTunnel Manager v2.0              ${NC}"
+    echo -e "${CYAN}               VTunnel Manager v0.1              ${NC}"
     echo -e "${CYAN}=================================================${NC}"
 }
 
