@@ -4,7 +4,7 @@
 # CONFIGURATION
 # آدرس ریپوزیتوری خود را اینجا وارد کنید (User/Repo)
 # مثال: GITHUB_REPO="hanselime/paqet"
-GITHUB_REPO="YOUR_USERNAME/YOUR_REPO_NAME"
+GITHUB_REPO="voono/vtunnel"
 BINARY_NAME="vtunnel"
 INSTALL_DIR="/usr/local/bin"
 # =========================================================
