@@ -21,14 +21,12 @@ import (
 )
 
 const (
-	salt         = "raw-tcp-tunnel-hopping-v4"
-	dataShards   = 10
-	parityShards = 3
-	mtuLimit     = 1200
-	
-	// بازه زمانی تغییر پورت (بین ۴۵ تا ۹۰ ثانیه)
-	hopMinInterval = 45
-	hopMaxInterval = 90
+	salt           = "raw-tcp-tunnel-handshake-v7"
+	dataShards     = 10
+	parityShards   = 3
+	mtuLimit       = 1200
+	hopMinInterval = 60
+	hopMaxInterval = 120
 )
 
 var bufPool = sync.Pool{
@@ -66,7 +64,7 @@ func main() {
 // ==========================================
 
 func runServer(port int, block kcp.BlockCrypt) {
-	log.Printf("🚀 [Server] Port-Hopping Supported Tunnel on Port %d...", port)
+	log.Printf("🚀 [Server] Handshake-Aware Tunnel Ready on Port %d...", port)
 
 	rawConn, err := NewRawTCPConn(port, 0, "server", "")
 	if err != nil {
@@ -97,13 +95,11 @@ func runServer(port int, block kcp.BlockCrypt) {
 		conn.SetNoDelay(1, 20, 1, 1)
 		conn.SetACKNoDelay(true)
 		conn.SetMtu(mtuLimit)
-		
-		// سرور باید صبور باشد چون کلاینت ممکن است پورت عوض کند
-		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
+		conn.SetReadDeadline(time.Now().Add(10 * time.Minute))
 
 		smuxConf := smux.DefaultConfig()
 		smuxConf.KeepAliveInterval = 5 * time.Second
-		smuxConf.KeepAliveTimeout = 15 * time.Second
+		smuxConf.KeepAliveTimeout = 20 * time.Second
 
 		mux, err := smux.Server(sess, smuxConf)
 		if err != nil {
@@ -123,7 +119,7 @@ func handleMux(mux *smux.Session, socksServer *socks5.Server) {
 		}
 		go func(s *smux.Stream) {
 			defer s.Close()
-			s.SetReadDeadline(time.Now().Add(5 * time.Minute))
+			s.SetReadDeadline(time.Now().Add(10 * time.Minute))
 
 			lenBuf := make([]byte, 1)
 			if _, err := io.ReadFull(s, lenBuf); err != nil {
@@ -158,15 +154,13 @@ func handleMux(mux *smux.Session, socksServer *socks5.Server) {
 // ==========================================
 
 func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.BlockCrypt) {
-	log.Printf("🚀 [Client] Starting with Live Port Hopping...")
+	log.Printf("🚀 [Client] Starting with Fake TCP Handshake...")
 
-	// ایجاد اتصال هوشمند با قابلیت چرخش پورت
 	hoppingConn, err := NewHoppingPacketConn(remoteIP, remotePort)
 	if err != nil {
 		log.Fatalf("Init Error: %v", err)
 	}
 	
-	// شروع فرآیند تغییر پورت در پس‌زمینه
 	go hoppingConn.StartRotation()
 
 	kcpSess, err := kcp.NewConn(fmt.Sprintf("%s:%d", remoteIP, remotePort), block, dataShards, parityShards, hoppingConn)
@@ -192,12 +186,11 @@ func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.Bl
 	}
 	defer session.Close()
 
-	// مانیتورینگ برای بسته شدن احتمالی
 	go func() {
 		for {
 			time.Sleep(2 * time.Second)
 			if session.IsClosed() {
-				log.Println("Session Closed -> Exiting to restart service")
+				log.Println("Session Closed -> Exiting")
 				os.Exit(1)
 			}
 		}
@@ -267,36 +260,90 @@ func pipe(c1, c2 io.ReadWriteCloser) {
 }
 
 // ==========================================
-//       HOPPING PACKET CONN (NEW)
+//       HOPPING WITH FAKE HANDSHAKE
 // ==========================================
 
-// این ساختار وظیفه دارد سوکت زیرین را بدون اینکه KCP بفهمد عوض کند
+type Packet struct {
+	Data []byte
+	Addr net.Addr
+	Err  error
+}
+
 type HoppingPacketConn struct {
-	mu          sync.RWMutex
-	activeConn  *RawTCPConn
-	remoteIP    string
-	remotePort  int
-	isClosed    bool
+	mu           sync.RWMutex
+	activeConn   *RawTCPConn
+	readCh       chan Packet
+	remoteIP     string
+	remotePort   int
+	isClosed     bool
 }
 
 func NewHoppingPacketConn(remoteIP string, remotePort int) (*HoppingPacketConn, error) {
-	// ایجاد اولین اتصال
-	initialPort := rand.Intn(10000) + 40000
-	conn, err := NewRawTCPConn(initialPort, remotePort, "client", remoteIP)
+	h := &HoppingPacketConn{
+		readCh:     make(chan Packet, 2000), 
+		remoteIP:   remoteIP,
+		remotePort: remotePort,
+	}
+
+	conn, err := h.createNewConn()
 	if err != nil {
 		return nil, err
 	}
 
-	return &HoppingPacketConn{
-		activeConn: conn,
-		remoteIP:   remoteIP,
-		remotePort: remotePort,
-	}, nil
+	h.activeConn = conn
+	go h.readLoop(conn)
+
+	return h, nil
 }
+
+func (h *HoppingPacketConn) createNewConn() (*RawTCPConn, error) {
+	port := rand.Intn(10000) + 40000
+	return NewRawTCPConn(port, h.remotePort, "client", h.remoteIP)
+}
+
+func (h *HoppingPacketConn) readLoop(conn *RawTCPConn) {
+	for {
+		buf := make([]byte, 4096) 
+		n, addr, err := conn.ReadFrom(buf)
+		if err != nil {
+			return 
+		}
+		// فیلتر کردن پکت‌های خالی یا هندشیک فیک
+		if n == 0 { 
+			continue 
+		}
+
+		select {
+		case h.readCh <- Packet{Data: buf[:n], Addr: addr, Err: nil}:
+		default:
+		}
+	}
+}
+
+// ارسال پکت‌های فیک برای گول زدن فایروال
+func (h *HoppingPacketConn) sendFakeHandshake(conn *RawTCPConn) {
+	// 1. ساخت پکت SYN
+	// فلگ SYN = 0x02
+	synPacket := MakeTCPHeaderCustom(conn.localPort, h.remotePort, 0x02, nil) 
+	
+	// ارسال SYN
+	dstIP := net.ParseIP(h.remoteIP)
+	conn.conn.WriteToIP(synPacket, &net.IPAddr{IP: dstIP})
+
+	// 2. کمی صبر (شبیه‌سازی RTT)
+	time.Sleep(50 * time.Millisecond)
+
+	// 3. ساخت پکت ACK
+	// فلگ ACK = 0x10
+	ackPacket := MakeTCPHeaderCustom(conn.localPort, h.remotePort, 0x10, nil)
+	conn.conn.WriteToIP(ackPacket, &net.IPAddr{IP: dstIP})
+	
+	// حالا کانکشن از نظر فایروال "ESTABLISHED" است
+}
+
 
 func (h *HoppingPacketConn) StartRotation() {
 	for {
-		// صبر تصادفی بین Min و Max
 		waitSec := rand.Intn(hopMaxInterval-hopMinInterval) + hopMinInterval
 		time.Sleep(time.Duration(waitSec) * time.Second)
 
@@ -304,59 +351,51 @@ func (h *HoppingPacketConn) StartRotation() {
 			return
 		}
 
-		// ساخت اتصال جدید
-		newPort := rand.Intn(15000) + 35000
-		newConn, err := NewRawTCPConn(newPort, h.remotePort, "client", h.remoteIP)
+		newConn, err := h.createNewConn()
 		if err != nil {
 			log.Printf("Rotation Failed: %v", err)
 			continue
 		}
 
-		// سوئیچ اتمی
+		// *** MAGIC HAPPENS HERE ***
+		// قبل از اینکه این کانکشن را فعال کنیم، هندشیک را اجرا می‌کنیم
+		h.sendFakeHandshake(newConn)
+		
+		log.Printf("♻️ [Hopping] Handshake sent. Switching to Port: %d", newConn.localPort)
+
+		// شروع خواندن از کانکشن جدید
+		go h.readLoop(newConn)
+
+		// سوییچ کردن کانکشن نوشتاری
 		h.mu.Lock()
 		oldConn := h.activeConn
 		h.activeConn = newConn
 		h.mu.Unlock()
 
-		log.Printf("♻️ [Hopping] Switched to Source Port: %d", newPort)
-
-		// بستن اتصال قدیمی (با کمی تاخیر برای دریافت پکت‌های در راه)
+		// نگه داشتن کانکشن قدیمی برای دریافت ACKهای جامانده (15 ثانیه)
 		go func(old *RawTCPConn) {
-			time.Sleep(2 * time.Second)
+			time.Sleep(15 * time.Second)
 			old.Close()
 		}(oldConn)
 	}
 }
 
 func (h *HoppingPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	for {
-		h.mu.RLock()
-		conn := h.activeConn
-		h.mu.RUnlock()
-
-		if h.isClosed {
-			return 0, nil, io.EOF
+	select {
+	case pkt := <-h.readCh:
+		if pkt.Err != nil {
+			return 0, nil, pkt.Err
 		}
-
-		n, addr, err = conn.ReadFrom(p)
-		
-		// اگر ارور گرفتیم، شاید بخاطر بسته شدن سوکت قدیمی موقع روتیشن باشد
-		// پس دوباره سعی می‌کنیم (مگر اینکه کلاً بسته شده باشیم)
-		if err != nil {
-			if strings.Contains(err.Error(), "closed network connection") {
-				// سوکت بسته شده، احتمالاً روتیشن رخ داده، برو از جدید بخون
-				continue
-			}
-			return n, addr, err
-		}
-		return n, addr, nil
+		copy(p, pkt.Data)
+		return len(pkt.Data), pkt.Addr, nil
 	}
 }
 
 func (h *HoppingPacketConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return h.activeConn.WriteTo(p, addr)
+	conn := h.activeConn
+	h.mu.RUnlock()
+	return conn.WriteTo(p, addr)
 }
 
 func (h *HoppingPacketConn) Close() error {
@@ -430,6 +469,13 @@ func (c *RawTCPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			continue
 		}
 
+		// بررسی فلگ‌ها: ما فقط دیتای PSH/ACK را می‌خواهیم
+		// اگر سرور (کرنل) در جواب SYN ما چیزی فرستاد، اینجا نادیده می‌گیریم
+		flags := buf[13]
+		if flags&0x02 != 0 { // SYN packet received? Ignore.
+			continue
+		}
+
 		copy(p, buf[20:n])
 
 		fakeUDPAddr := &net.UDPAddr{
@@ -457,22 +503,30 @@ func (c *RawTCPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		}
 	}
 
-	tcpHeader := MakeTCPHeader(c.localPort, dstPort, p)
+	// 0x18 = PSH | ACK (دیتای نرمال)
+	tcpHeader := MakeTCPHeaderCustom(c.localPort, dstPort, 0x18, p)
 	packet := append(tcpHeader, p...)
 
 	_, err = c.conn.WriteToIP(packet, &net.IPAddr{IP: dstIP})
 	return len(p), err
 }
 
-func MakeTCPHeader(srcPort, dstPort int, payload []byte) []byte {
+// تابع ساخت هدر با قابلیت تعیین فلگ‌ها
+func MakeTCPHeaderCustom(srcPort, dstPort int, flags byte, payload []byte) []byte {
 	h := make([]byte, 20)
 	binary.BigEndian.PutUint16(h[0:2], uint16(srcPort))
 	binary.BigEndian.PutUint16(h[2:4], uint16(dstPort))
+	// Seq and Ack numbers - Random is fine for FakeTCP usually
 	binary.BigEndian.PutUint32(h[4:8], rand.Uint32())
 	binary.BigEndian.PutUint32(h[8:12], rand.Uint32())
-	h[12] = 0x50 
-	h[13] = 0x18 
-	binary.BigEndian.PutUint16(h[14:16], 65535) 
+	
+	h[12] = 0x50 // Header Length
+	h[13] = flags // Control Flags (SYN, ACK, PSH, etc)
+	binary.BigEndian.PutUint16(h[14:16], 65535) // Window Size
+	
+	// Checksum (Simplified: often redundant if OS does NIC offloading, but good to have zeroed)
+	// We skip strict checksum calc for performance as GFW often ignores it for simple TCP checks
+	
 	return h
 }
 
