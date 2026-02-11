@@ -7,7 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"math/rand"
+	"math/rand/v2"
 	"net"
 	"os"
 	"strings"
@@ -24,29 +24,65 @@ const (
 	salt         = "raw-tcp-tunnel-dual-mode"
 	dataShards   = 10
 	parityShards = 3
-	mtuLimit     = 1200
+	mtuLimit     = 1400 // increased from 1200 — safe within 1500 MTU minus IP+TCP headers
 )
 
-var bufPool = sync.Pool{
+// copyBufPool — 32KB buffers for pipe() data transfer (up from 4KB)
+var copyBufPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 4096)
+		buf := make([]byte, 32*1024)
+		return &buf
 	},
+}
+
+// rawReadBufPool — 64KB buffers for raw socket reads (max IP packet size)
+var rawReadBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 65536)
+		return &buf
+	},
+}
+
+// writeBufPool — reusable buffers for WriteTo to avoid per-packet allocation
+var writeBufPool = sync.Pool{
+	New: func() interface{} {
+		buf := make([]byte, 20+mtuLimit+100) // TCP header + max payload + margin
+		return &buf
+	},
+}
+
+// smuxConfig returns a tuned smux configuration for high throughput and fast keep-alive
+func smuxConfig() *smux.Config {
+	cfg := smux.DefaultConfig()
+	cfg.Version = 1
+	cfg.KeepAliveInterval = 5 * time.Second  // fast detection of dead peers
+	cfg.KeepAliveTimeout = 15 * time.Second   // fail fast on dead connections
+	cfg.MaxFrameSize = 16384                  // 16KB frames — larger = fewer round-trips
+	cfg.MaxReceiveBuffer = 8 * 1024 * 1024    // 8MB receive buffer per session
+	cfg.MaxStreamBuffer = 2 * 1024 * 1024     // 2MB per stream buffer
+	return cfg
+}
+
+// applyKCPTuning applies consistent, optimized KCP settings to a session.
+// Both client and server MUST use the same window/NoDelay values for proper flow control.
+func applyKCPTuning(conn *kcp.UDPSession) {
+	conn.SetStreamMode(true)
+	conn.SetNoDelay(1, 10, 2, 1) // nodelay=1, interval=10ms, resend=2 (fast retransmit), nc=1 (no congestion)
+	conn.SetWindowSize(2048, 2048) // balanced send/receive window — matched on both sides
+	conn.SetACKNoDelay(true)       // flush ACKs immediately — reduces RTT
+	conn.SetMtu(mtuLimit)
+	conn.SetReadBuffer(16 * 1024 * 1024)
+	conn.SetWriteBuffer(16 * 1024 * 1024)
 }
 
 func main() {
 	mode := flag.String("mode", "server", "Mode: 'server' or 'client'")
-	
-	// *** FIX: Default value changed from ":1080" to "" (Empty String) ***
-	// This ensures SOCKS doesn't start unless -listen is explicitly passed
 	listen := flag.String("listen", "", "SOCKS5 Listen Address (e.g. :1080)")
-	
 	fwd := flag.String("fwd", "", "Port Forwarding: 'LocalPort:RemoteIP:RemotePort'")
 	remote := flag.String("remote", "", "Server IP")
 	port := flag.Int("port", 443, "Tunnel Port")
 	key := flag.String("key", "secret", "Encryption key")
 	flag.Parse()
-
-	rand.Seed(time.Now().UnixNano())
 
 	pass := pbkdf2.Key([]byte(*key), []byte(salt), 4096, 32, sha1.New)
 	block, _ := kcp.NewAESBlockCrypt(pass)
@@ -66,7 +102,7 @@ func main() {
 // ==========================================
 
 func runServer(port int, block kcp.BlockCrypt) {
-	log.Printf("🚀 [Server] Dual-Mode Tunnel starting on Port %d...", port)
+	log.Printf("[Server] Dual-Mode Tunnel starting on Port %d...", port)
 
 	rawConn, err := NewRawTCPConn(port, 0, "server", "")
 	if err != nil {
@@ -88,27 +124,16 @@ func runServer(port int, block kcp.BlockCrypt) {
 	for {
 		sess, err := listener.Accept()
 		if err != nil {
+			log.Printf("[Server] Accept error: %v", err)
 			continue
 		}
 
 		conn := sess.(*kcp.UDPSession)
-		conn.SetStreamMode(true)
-		// 2. کاهش پنجره ارسال (مهمترین تغییر)
-		// از 4096 به 1024 (یا حتی 512 اگر تعداد کاربر خیلی زیاد شد)
-		// 3. تنظیمات NoDelay متعادل
-		// nodelay: 1 (روشن)
-		// interval: 20 (از 10 به 20 تغییر بده تا CPU و شبکه نفس بکشن)
-		// resend: 1 (از 2 به 1 تغییر بده تا الکی پکت تکراری نفرسته)
-		// nc: 1 (همچنان Congestion Control خاموش باشه تا سرعت افت نکنه)
-		conn.SetNoDelay(1, 20, 1, 1)
+		applyKCPTuning(conn)
 
-		// 4. بقیه تنظیمات (بدون تغییر)
-		conn.SetWindowSize(1024, 1024)
-		conn.SetACKNoDelay(true)
-		conn.SetMtu(mtuLimit)
-
-		mux, err := smux.Server(sess, nil)
+		mux, err := smux.Server(sess, smuxConfig())
 		if err != nil {
+			log.Printf("[Server] Smux error: %v", err)
 			continue
 		}
 
@@ -145,10 +170,14 @@ func handleMux(mux *smux.Session, socksServer *socks5.Server) {
 
 			remoteConn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
 			if err != nil {
-				// log.Printf("[Forward] Failed to dial %s: %v", targetAddr, err)
 				return
 			}
 			defer remoteConn.Close()
+
+			// Set TCP_NODELAY on the outbound connection for lower latency
+			if tc, ok := remoteConn.(*net.TCPConn); ok {
+				tc.SetNoDelay(true)
+			}
 
 			pipe(s, remoteConn)
 		}(stream)
@@ -160,131 +189,167 @@ func handleMux(mux *smux.Session, socksServer *socks5.Server) {
 // ==========================================
 
 func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.BlockCrypt) {
-	log.Printf("🚀 [Client] Connecting to %s:%d...", remoteIP, remotePort)
+	for {
+		session := connectToServer(remoteIP, remotePort, block)
+		if session == nil {
+			log.Printf("[Client] Connection failed, retrying in 3s...")
+			time.Sleep(3 * time.Second)
+			continue
+		}
 
-	localSrcPort := rand.Intn(10000) + 50000
+		log.Printf("[Client] Connected to %s:%d", remoteIP, remotePort)
+
+		// Channel to signal when session dies
+		done := make(chan struct{})
+
+		// Start listeners only once — they re-open streams on the current session
+		if socksAddr != "" {
+			go startListener(socksAddr, "", session, done)
+		}
+
+		if fwdRule != "" {
+			rules := strings.Split(fwdRule, ",")
+			for _, rule := range rules {
+				parts := strings.SplitN(rule, ":", 2)
+				if len(parts) == 2 {
+					localPort := parts[0]
+					targetAddr := parts[1]
+					go startListener(":"+localPort, targetAddr, session, done)
+				} else {
+					log.Printf("[Error] Invalid fwd rule: %s", rule)
+				}
+			}
+		}
+
+		// Monitor session health
+		monitorSession(session, done)
+
+		log.Printf("[Client] Session lost, reconnecting in 2s...")
+		time.Sleep(2 * time.Second)
+	}
+}
+
+func connectToServer(remoteIP string, remotePort int, block kcp.BlockCrypt) *smux.Session {
+	localSrcPort := rand.IntN(10000) + 50000
 	rawConn, err := NewRawTCPConn(localSrcPort, remotePort, "client", remoteIP)
 	if err != nil {
-		log.Fatalf("Socket Error: %v", err)
+		log.Printf("[Client] Socket Error: %v", err)
+		return nil
 	}
 
 	kcpSess, err := kcp.NewConn(fmt.Sprintf("%s:%d", remoteIP, remotePort), block, dataShards, parityShards, rawConn)
 	if err != nil {
-		log.Fatal(err)
+		log.Printf("[Client] KCP Error: %v", err)
+		return nil
 	}
 
-	kcpSess.SetStreamMode(true)
-	kcpSess.SetWindowSize(4096, 4096)
-	kcpSess.SetNoDelay(1, 10, 2, 1)
-	kcpSess.SetACKNoDelay(true)
-	kcpSess.SetMtu(mtuLimit)
-	kcpSess.SetReadBuffer(16 * 1024 * 1024)
-	kcpSess.SetWriteBuffer(16 * 1024 * 1024)
+	applyKCPTuning(kcpSess)
+	kcpSess.SetDSCP(46) // EF (Expedited Forwarding) — priority QoS
 
-	session, err := smux.Client(kcpSess, nil)
+	session, err := smux.Client(kcpSess, smuxConfig())
 	if err != nil {
-		log.Fatal(err)
-	}
-	defer session.Close()
-
-	go func() {
-		for {
-			time.Sleep(5 * time.Second)
-			if session.IsClosed() {
-				os.Exit(1)
-			}
-		}
-	}()
-
-	// *** منطق جدید: فقط اگر آدرس خالی نباشد استارت می‌کند ***
-	if socksAddr != "" {
-		go startListener(socksAddr, "", session)
+		log.Printf("[Client] Smux Error: %v", err)
+		kcpSess.Close()
+		return nil
 	}
 
-	if fwdRule != "" {
-		// پشتیبانی از چند پورت با ویرگول
-		// Format: 8080:1.1.1.1:80,9090:8.8.8.8:53
-		rules := strings.Split(fwdRule, ",")
-		for _, rule := range rules {
-			parts := strings.SplitN(rule, ":", 2)
-			if len(parts) == 2 {
-				localPort := parts[0]
-				targetAddr := parts[1]
-				go startListener(":"+localPort, targetAddr, session)
-			} else {
-				log.Printf("[Error] Invalid fwd rule: %s", rule)
-			}
-		}
-	}
-
-	select {}
+	return session
 }
 
-func startListener(localAddr, targetAddr string, session *smux.Session) {
+func monitorSession(session *smux.Session, done chan struct{}) {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+	for {
+		<-ticker.C
+		if session.IsClosed() {
+			close(done)
+			return
+		}
+	}
+}
+
+func startListener(localAddr, targetAddr string, session *smux.Session, done chan struct{}) {
 	ln, err := net.Listen("tcp", localAddr)
 	if err != nil {
 		log.Printf("Failed to listen on %s: %v", localAddr, err)
 		return
 	}
-	
+	defer ln.Close()
+
 	mode := "SOCKS5"
 	if targetAddr != "" {
 		mode = fmt.Sprintf("Forward -> %s", targetAddr)
 	}
-	log.Printf("✅ [Client] Service Ready: %s on %s", mode, localAddr)
+	log.Printf("[Client] Service Ready: %s on %s", mode, localAddr)
+
+	// Close the listener when the session dies so Accept() unblocks
+	go func() {
+		<-done
+		ln.Close()
+	}()
 
 	for {
 		p1, err := ln.Accept()
 		if err != nil {
+			select {
+			case <-done:
+				return // session died, exit cleanly
+			default:
+			}
 			continue
 		}
-		go func(local net.Conn) {
-			p2, err := session.OpenStream()
-			if err != nil {
-				local.Close()
-				return
-			}
-
-			if targetAddr == "" {
-				p2.Write([]byte{0})
-			} else {
-				addrBytes := []byte(targetAddr)
-				if len(addrBytes) > 255 {
-					local.Close()
-					p2.Close()
-					return
-				}
-				p2.Write([]byte{byte(len(addrBytes))})
-				p2.Write(addrBytes)
-			}
-
-			pipe(local, p2)
-		}(p1)
+		go handleLocalConn(p1, targetAddr, session)
 	}
 }
 
+func handleLocalConn(local net.Conn, targetAddr string, session *smux.Session) {
+	p2, err := session.OpenStream()
+	if err != nil {
+		local.Close()
+		return
+	}
+
+	if targetAddr == "" {
+		p2.Write([]byte{0})
+	} else {
+		addrBytes := []byte(targetAddr)
+		if len(addrBytes) > 255 {
+			local.Close()
+			p2.Close()
+			return
+		}
+		p2.Write([]byte{byte(len(addrBytes))})
+		p2.Write(addrBytes)
+	}
+
+	pipe(local, p2)
+}
+
+// pipe bidirectionally copies data between two connections using pooled 32KB buffers.
 func pipe(p1, p2 io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { 
-		buf := bufPool.Get().([]byte)
-		defer bufPool.Put(buf)
-		io.CopyBuffer(p1, p2, buf)
-		p1.Close()
-		wg.Done() 
-	}()
-	go func() { 
-		buf := bufPool.Get().([]byte)
-		defer bufPool.Put(buf)
-		io.CopyBuffer(p2, p1, buf)
-		p2.Close()
-		wg.Done() 
-	}()
+	halfClose := func(dst, src io.ReadWriteCloser) {
+		defer wg.Done()
+		bufp := copyBufPool.Get().(*[]byte)
+		defer copyBufPool.Put(bufp)
+		io.CopyBuffer(dst, src, *bufp)
+		// Signal write-close if supported; otherwise hard close
+		if tc, ok := dst.(interface{ CloseWrite() error }); ok {
+			tc.CloseWrite()
+		} else {
+			dst.Close()
+		}
+	}
+	go halfClose(p1, p2)
+	go halfClose(p2, p1)
 	wg.Wait()
+	p1.Close()
+	p2.Close()
 }
 
 // ==========================================
-//       RAW SOCKET (NO CHANGE)
+//       RAW SOCKET (OPTIMIZED)
 // ==========================================
 
 type RawTCPConn struct {
@@ -318,8 +383,9 @@ func NewRawTCPConn(localPort, remotePort int, mode, remoteIPStr string) (*RawTCP
 }
 
 func (c *RawTCPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	buf := bufPool.Get().([]byte)
-	defer bufPool.Put(buf)
+	bufp := rawReadBufPool.Get().(*[]byte)
+	defer rawReadBufPool.Put(bufp)
+	buf := *bufp
 
 	for {
 		n, src, err := c.conn.ReadFrom(buf)
@@ -337,6 +403,7 @@ func (c *RawTCPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			continue
 		}
 
+		payloadLen := n - 20
 		copy(p, buf[20:n])
 
 		fakeUDPAddr := &net.UDPAddr{
@@ -344,7 +411,7 @@ func (c *RawTCPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 			Port: int(packetSrcPort),
 		}
 
-		return n - 20, fakeUDPAddr, nil
+		return payloadLen, fakeUDPAddr, nil
 	}
 }
 
@@ -364,23 +431,29 @@ func (c *RawTCPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		}
 	}
 
-	tcpHeader := MakeTCPHeader(c.localPort, dstPort, p)
-	packet := append(tcpHeader, p...)
+	// Use pooled buffer to avoid allocation on every write
+	bufp := writeBufPool.Get().(*[]byte)
+	defer writeBufPool.Put(bufp)
+	packet := *bufp
 
-	_, err = c.conn.WriteToIP(packet, &net.IPAddr{IP: dstIP})
+	// Build TCP header directly into pooled buffer
+	binary.BigEndian.PutUint16(packet[0:2], uint16(c.localPort))
+	binary.BigEndian.PutUint16(packet[2:4], uint16(dstPort))
+	binary.BigEndian.PutUint32(packet[4:8], rand.Uint32())
+	binary.BigEndian.PutUint32(packet[8:12], rand.Uint32())
+	packet[12] = 0x50 // data offset: 5 words (20 bytes)
+	packet[13] = 0x18 // ACK + PSH flags
+	binary.BigEndian.PutUint16(packet[14:16], 65535) // window size
+	packet[16] = 0    // checksum (zeroed)
+	packet[17] = 0
+	packet[18] = 0    // urgent pointer
+	packet[19] = 0
+
+	// Copy payload after header
+	copy(packet[20:], p)
+
+	_, err = c.conn.WriteToIP(packet[:20+len(p)], &net.IPAddr{IP: dstIP})
 	return len(p), err
-}
-
-func MakeTCPHeader(srcPort, dstPort int, payload []byte) []byte {
-	h := make([]byte, 20)
-	binary.BigEndian.PutUint16(h[0:2], uint16(srcPort))
-	binary.BigEndian.PutUint16(h[2:4], uint16(dstPort))
-	binary.BigEndian.PutUint32(h[4:8], rand.Uint32())
-	binary.BigEndian.PutUint32(h[8:12], rand.Uint32())
-	h[12] = 0x50 
-	h[13] = 0x18 
-	binary.BigEndian.PutUint16(h[14:16], 65535) 
-	return h
 }
 
 func (c *RawTCPConn) Close() error                       { return c.conn.Close() }
