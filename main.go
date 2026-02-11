@@ -21,10 +21,13 @@ import (
 )
 
 const (
-	salt         = "raw-tcp-tunnel-dual-mode"
+	salt         = "raw-tcp-tunnel-stable-v2"
 	dataShards   = 10
 	parityShards = 3
 	mtuLimit     = 1200
+	
+	// تنظیمات حیاتی برای جلوگیری از فریز شدن
+	idleTimeout  = 60 * time.Second // کانکشن بیکار بعد از ۶۰ ثانیه بسته شود
 )
 
 var bufPool = sync.Pool{
@@ -35,12 +38,8 @@ var bufPool = sync.Pool{
 
 func main() {
 	mode := flag.String("mode", "server", "Mode: 'server' or 'client'")
-	
-	// *** FIX: Default value changed from ":1080" to "" (Empty String) ***
-	// This ensures SOCKS doesn't start unless -listen is explicitly passed
-	listen := flag.String("listen", "", "SOCKS5 Listen Address (e.g. :1080)")
-	
-	fwd := flag.String("fwd", "", "Port Forwarding: 'LocalPort:RemoteIP:RemotePort'")
+	listen := flag.String("listen", "", "SOCKS5 Listen Address")
+	fwd := flag.String("fwd", "", "Port Forwarding")
 	remote := flag.String("remote", "", "Server IP")
 	port := flag.Int("port", 443, "Tunnel Port")
 	key := flag.String("key", "secret", "Encryption key")
@@ -66,7 +65,7 @@ func main() {
 // ==========================================
 
 func runServer(port int, block kcp.BlockCrypt) {
-	log.Printf("🚀 [Server] Dual-Mode Tunnel starting on Port %d...", port)
+	log.Printf("🚀 [Server] Stable Tunnel (Auto-Cleanup) starting on Port %d...", port)
 
 	rawConn, err := NewRawTCPConn(port, 0, "server", "")
 	if err != nil {
@@ -92,22 +91,23 @@ func runServer(port int, block kcp.BlockCrypt) {
 		}
 
 		conn := sess.(*kcp.UDPSession)
+		// تنظیمات پایدار (نه خیلی تهاجمی)
 		conn.SetStreamMode(true)
-		// 2. کاهش پنجره ارسال (مهمترین تغییر)
-		// از 4096 به 1024 (یا حتی 512 اگر تعداد کاربر خیلی زیاد شد)
-		// 3. تنظیمات NoDelay متعادل
-		// nodelay: 1 (روشن)
-		// interval: 20 (از 10 به 20 تغییر بده تا CPU و شبکه نفس بکشن)
-		// resend: 1 (از 2 به 1 تغییر بده تا الکی پکت تکراری نفرسته)
-		// nc: 1 (همچنان Congestion Control خاموش باشه تا سرعت افت نکنه)
-		conn.SetNoDelay(1, 20, 1, 1)
-
-		// 4. بقیه تنظیمات (بدون تغییر)
-		conn.SetWindowSize(1024, 1024)
+		conn.SetWindowSize(1024, 1024) // 1024 کافیست، 4096 باعث انباشت بافر می‌شود
+		conn.SetNoDelay(1, 20, 1, 1)   // Interval 20ms برای کاهش لود CPU
 		conn.SetACKNoDelay(true)
 		conn.SetMtu(mtuLimit)
+		
+		// تنظیم Deadline برای خود سشن KCP
+		// اگر کلاینت ۳ دقیقه غیبش زد، کل سشن را ببند
+		conn.SetReadDeadline(time.Now().Add(3 * time.Minute))
 
-		mux, err := smux.Server(sess, nil)
+		// کانفیگ Smux با تایم‌اوت‌های سخت‌گیرانه
+		smuxConf := smux.DefaultConfig()
+		smuxConf.KeepAliveInterval = 10 * time.Second
+		smuxConf.KeepAliveTimeout = 30 * time.Second
+
+		mux, err := smux.Server(sess, smuxConf)
 		if err != nil {
 			continue
 		}
@@ -125,6 +125,9 @@ func handleMux(mux *smux.Session, socksServer *socks5.Server) {
 		}
 		go func(s *smux.Stream) {
 			defer s.Close()
+			
+			// تنظیم ددلاین برای استریم ورودی
+			s.SetReadDeadline(time.Now().Add(idleTimeout))
 
 			lenBuf := make([]byte, 1)
 			if _, err := io.ReadFull(s, lenBuf); err != nil {
@@ -145,7 +148,6 @@ func handleMux(mux *smux.Session, socksServer *socks5.Server) {
 
 			remoteConn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
 			if err != nil {
-				// log.Printf("[Forward] Failed to dial %s: %v", targetAddr, err)
 				return
 			}
 			defer remoteConn.Close()
@@ -174,45 +176,48 @@ func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.Bl
 	}
 
 	kcpSess.SetStreamMode(true)
-	kcpSess.SetWindowSize(4096, 4096)
-	kcpSess.SetNoDelay(1, 10, 2, 1)
+	kcpSess.SetWindowSize(1024, 1024)
+	kcpSess.SetNoDelay(1, 20, 1, 1)
 	kcpSess.SetACKNoDelay(true)
 	kcpSess.SetMtu(mtuLimit)
 	kcpSess.SetReadBuffer(16 * 1024 * 1024)
 	kcpSess.SetWriteBuffer(16 * 1024 * 1024)
 
-	session, err := smux.Client(kcpSess, nil)
+	// تنظیم ددلاین KCP
+	kcpSess.SetReadDeadline(time.Now().Add(3 * time.Minute))
+
+	smuxConf := smux.DefaultConfig()
+	smuxConf.KeepAliveInterval = 10 * time.Second
+	smuxConf.KeepAliveTimeout = 30 * time.Second
+
+	session, err := smux.Client(kcpSess, smuxConf)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer session.Close()
 
+	// Watchdog: اگر سشن بسته شد برنامه را ببند تا سرویس ریستارتش کند
 	go func() {
-		for {
-			time.Sleep(5 * time.Second)
+		ticker := time.NewTicker(5 * time.Second)
+		for range ticker.C {
 			if session.IsClosed() {
 				os.Exit(1)
 			}
+			// تمدید ددلاین سشن اصلی (چون زنده است)
+			kcpSess.SetReadDeadline(time.Now().Add(3 * time.Minute))
 		}
 	}()
 
-	// *** منطق جدید: فقط اگر آدرس خالی نباشد استارت می‌کند ***
 	if socksAddr != "" {
 		go startListener(socksAddr, "", session)
 	}
 
 	if fwdRule != "" {
-		// پشتیبانی از چند پورت با ویرگول
-		// Format: 8080:1.1.1.1:80,9090:8.8.8.8:53
 		rules := strings.Split(fwdRule, ",")
 		for _, rule := range rules {
 			parts := strings.SplitN(rule, ":", 2)
 			if len(parts) == 2 {
-				localPort := parts[0]
-				targetAddr := parts[1]
-				go startListener(":"+localPort, targetAddr, session)
-			} else {
-				log.Printf("[Error] Invalid fwd rule: %s", rule)
+				go startListener(":"+parts[0], parts[1], session)
 			}
 		}
 	}
@@ -226,12 +231,7 @@ func startListener(localAddr, targetAddr string, session *smux.Session) {
 		log.Printf("Failed to listen on %s: %v", localAddr, err)
 		return
 	}
-	
-	mode := "SOCKS5"
-	if targetAddr != "" {
-		mode = fmt.Sprintf("Forward -> %s", targetAddr)
-	}
-	log.Printf("✅ [Client] Service Ready: %s on %s", mode, localAddr)
+	log.Printf("✅ [Client] Ready: %s", localAddr)
 
 	for {
 		p1, err := ln.Accept()
@@ -244,6 +244,9 @@ func startListener(localAddr, targetAddr string, session *smux.Session) {
 				local.Close()
 				return
 			}
+			
+			// تنظیم Timeout برای استریم جدید
+			p2.SetReadDeadline(time.Now().Add(idleTimeout))
 
 			if targetAddr == "" {
 				p2.Write([]byte{0})
@@ -263,28 +266,57 @@ func startListener(localAddr, targetAddr string, session *smux.Session) {
 	}
 }
 
-func pipe(p1, p2 io.ReadWriteCloser) {
+// تابع Pipe اصلاح شده با قابلیت مدیریت Timeout
+func pipe(c1, c2 io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { 
-		buf := bufPool.Get().([]byte)
-		defer bufPool.Put(buf)
-		io.CopyBuffer(p1, p2, buf)
-		p1.Close()
-		wg.Done() 
+
+	// کپی از C1 به C2
+	go func() {
+		defer wg.Done()
+		copyLoop(c1, c2)
+		c1.Close() // بستن اجباری طرف مقابل
 	}()
-	go func() { 
-		buf := bufPool.Get().([]byte)
-		defer bufPool.Put(buf)
-		io.CopyBuffer(p2, p1, buf)
-		p2.Close()
-		wg.Done() 
+
+	// کپی از C2 به C1
+	go func() {
+		defer wg.Done()
+		copyLoop(c2, c1)
+		c2.Close()
 	}()
+
 	wg.Wait()
 }
 
+// حلقه کپی که با هر بار خواندن دیتا، ددلاین را تمدید می‌کند
+func copyLoop(src io.Reader, dst io.Writer) {
+	buf := bufPool.Get().([]byte)
+	defer bufPool.Put(buf)
+
+	for {
+		// اگر src قابلیت تنظیم ددلاین دارد، تمدیدش کن
+		if conn, ok := src.(interface{ SetReadDeadline(time.Time) error }); ok {
+			conn.SetReadDeadline(time.Now().Add(idleTimeout))
+		}
+
+		nr, err := src.Read(buf)
+		if nr > 0 {
+			nw, ew := dst.Write(buf[0:nr])
+			if nw < 0 || nr < nw {
+				break
+			}
+			if ew != nil {
+				break
+			}
+		}
+		if err != nil {
+			break
+		}
+	}
+}
+
 // ==========================================
-//       RAW SOCKET (NO CHANGE)
+//       RAW SOCKET (بدون تغییر نسبت به قبل)
 // ==========================================
 
 type RawTCPConn struct {
