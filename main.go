@@ -24,13 +24,13 @@ const (
 	salt         = "raw-tcp-tunnel-dual-mode"
 	dataShards   = 10
 	parityShards = 3
-	mtuLimit     = 1400 // increased from 1200 — safe within 1500 MTU minus IP+TCP headers
+	mtuLimit     = 1200 // small MTU — avoids fragmentation and DPI flags on restricted networks
 )
 
-// copyBufPool — 32KB buffers for pipe() data transfer (up from 4KB)
+// copyBufPool — 16KB buffers for pipe() data transfer
 var copyBufPool = sync.Pool{
 	New: func() interface{} {
-		buf := make([]byte, 32*1024)
+		buf := make([]byte, 16*1024)
 		return &buf
 	},
 }
@@ -51,28 +51,36 @@ var writeBufPool = sync.Pool{
 	},
 }
 
-// smuxConfig returns a tuned smux configuration for high throughput and fast keep-alive
+// smuxConfig returns a tuned smux configuration for restricted/lossy networks (GFW, Iran).
+// Priority: low latency, fast dead-peer detection, avoid bufferbloat.
 func smuxConfig() *smux.Config {
 	cfg := smux.DefaultConfig()
 	cfg.Version = 1
-	cfg.KeepAliveInterval = 5 * time.Second  // fast detection of dead peers
-	cfg.KeepAliveTimeout = 15 * time.Second   // fail fast on dead connections
-	cfg.MaxFrameSize = 16384                  // 16KB frames — larger = fewer round-trips
-	cfg.MaxReceiveBuffer = 8 * 1024 * 1024    // 8MB receive buffer per session
-	cfg.MaxStreamBuffer = 2 * 1024 * 1024     // 2MB per stream buffer
+	cfg.KeepAliveInterval = 5 * time.Second   // detect dead peers quickly
+	cfg.KeepAliveTimeout = 15 * time.Second    // fail fast on dead connections
+	cfg.MaxFrameSize = 4096                    // small frames — less head-of-line blocking, lower latency
+	cfg.MaxReceiveBuffer = 2 * 1024 * 1024     // 2MB session buffer — enough for bursts, avoids bloat
+	cfg.MaxStreamBuffer = 256 * 1024           // 256KB per stream — prevents queuing on slow links
 	return cfg
 }
 
-// applyKCPTuning applies consistent, optimized KCP settings to a session.
-// Both client and server MUST use the same window/NoDelay values for proper flow control.
+// applyKCPTuning applies consistent KCP settings tuned for restricted/lossy networks.
+// Both client and server MUST use identical values for proper flow control.
+//
+// Design rationale for GFW/Iran:
+//   - Small window (512) = less data in-flight = less queuing on throttled links
+//   - interval=10ms = fast internal clock for quick retransmit
+//   - resend=2 = aggressive fast retransmit after 2 dup ACKs (critical for high loss)
+//   - nc=1 = no congestion control (GFW throttling would falsely trigger CC and kill speed)
+//   - ACKNoDelay = flush ACKs immediately instead of batching (saves 1 RTT per ACK)
 func applyKCPTuning(conn *kcp.UDPSession) {
 	conn.SetStreamMode(true)
-	conn.SetNoDelay(1, 10, 2, 1) // nodelay=1, interval=10ms, resend=2 (fast retransmit), nc=1 (no congestion)
-	conn.SetWindowSize(2048, 2048) // balanced send/receive window — matched on both sides
-	conn.SetACKNoDelay(true)       // flush ACKs immediately — reduces RTT
+	conn.SetNoDelay(1, 10, 2, 1)
+	conn.SetWindowSize(512, 512)
+	conn.SetACKNoDelay(true)
 	conn.SetMtu(mtuLimit)
-	conn.SetReadBuffer(16 * 1024 * 1024)
-	conn.SetWriteBuffer(16 * 1024 * 1024)
+	conn.SetReadBuffer(4 * 1024 * 1024)  // 4MB — enough for bursts, avoids OS-level bufferbloat
+	conn.SetWriteBuffer(4 * 1024 * 1024)
 }
 
 func main() {
@@ -115,8 +123,8 @@ func runServer(port int, block kcp.BlockCrypt) {
 	}
 
 	listener.SetDSCP(46)
-	listener.SetReadBuffer(16 * 1024 * 1024)
-	listener.SetWriteBuffer(16 * 1024 * 1024)
+	listener.SetReadBuffer(4 * 1024 * 1024)
+	listener.SetWriteBuffer(4 * 1024 * 1024)
 
 	socksConf := &socks5.Config{Logger: log.New(os.Stderr, "[SOCKS] ", log.LstdFlags)}
 	socksServer, _ := socks5.New(socksConf)
@@ -325,7 +333,7 @@ func handleLocalConn(local net.Conn, targetAddr string, session *smux.Session) {
 	pipe(local, p2)
 }
 
-// pipe bidirectionally copies data between two connections using pooled 32KB buffers.
+// pipe bidirectionally copies data between two connections using pooled 16KB buffers.
 func pipe(p1, p2 io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -365,8 +373,8 @@ func NewRawTCPConn(localPort, remotePort int, mode, remoteIPStr string) (*RawTCP
 	if err != nil {
 		return nil, err
 	}
-	conn.SetReadBuffer(16 * 1024 * 1024)
-	conn.SetWriteBuffer(16 * 1024 * 1024)
+	conn.SetReadBuffer(4 * 1024 * 1024)
+	conn.SetWriteBuffer(4 * 1024 * 1024)
 
 	var rip net.IP
 	if remoteIPStr != "" {
