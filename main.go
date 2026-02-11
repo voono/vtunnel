@@ -21,21 +21,14 @@ import (
 )
 
 const (
-	salt         = "raw-tcp-tunnel-handshake-v5"
+	salt         = "raw-tcp-tunnel-hopping-v4"
 	dataShards   = 10
 	parityShards = 3
 	mtuLimit     = 1200
 	
-	// فواصل زمانی تغییر پورت
+	// بازه زمانی تغییر پورت (بین ۴۵ تا ۹۰ ثانیه)
 	hopMinInterval = 45
 	hopMaxInterval = 90
-
-	// پرچم‌های TCP
-	TCP_FIN = 0x01
-	TCP_SYN = 0x02
-	TCP_RST = 0x04
-	TCP_PSH = 0x08
-	TCP_ACK = 0x10
 )
 
 var bufPool = sync.Pool{
@@ -73,7 +66,7 @@ func main() {
 // ==========================================
 
 func runServer(port int, block kcp.BlockCrypt) {
-	log.Printf("🚀 [Server] Handshake-Aware Tunnel starting on Port %d...", port)
+	log.Printf("🚀 [Server] Port-Hopping Supported Tunnel on Port %d...", port)
 
 	rawConn, err := NewRawTCPConn(port, 0, "server", "")
 	if err != nil {
@@ -104,6 +97,8 @@ func runServer(port int, block kcp.BlockCrypt) {
 		conn.SetNoDelay(1, 20, 1, 1)
 		conn.SetACKNoDelay(true)
 		conn.SetMtu(mtuLimit)
+		
+		// سرور باید صبور باشد چون کلاینت ممکن است پورت عوض کند
 		conn.SetReadDeadline(time.Now().Add(5 * time.Minute))
 
 		smuxConf := smux.DefaultConfig()
@@ -163,13 +158,15 @@ func handleMux(mux *smux.Session, socksServer *socks5.Server) {
 // ==========================================
 
 func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.BlockCrypt) {
-	log.Printf("🚀 [Client] Connecting with TCP Handshake Simulation...")
+	log.Printf("🚀 [Client] Starting with Live Port Hopping...")
 
+	// ایجاد اتصال هوشمند با قابلیت چرخش پورت
 	hoppingConn, err := NewHoppingPacketConn(remoteIP, remotePort)
 	if err != nil {
 		log.Fatalf("Init Error: %v", err)
 	}
 	
+	// شروع فرآیند تغییر پورت در پس‌زمینه
 	go hoppingConn.StartRotation()
 
 	kcpSess, err := kcp.NewConn(fmt.Sprintf("%s:%d", remoteIP, remotePort), block, dataShards, parityShards, hoppingConn)
@@ -195,11 +192,12 @@ func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.Bl
 	}
 	defer session.Close()
 
+	// مانیتورینگ برای بسته شدن احتمالی
 	go func() {
 		for {
 			time.Sleep(2 * time.Second)
 			if session.IsClosed() {
-				log.Println("Session Closed -> Restarting")
+				log.Println("Session Closed -> Exiting to restart service")
 				os.Exit(1)
 			}
 		}
@@ -269,9 +267,10 @@ func pipe(c1, c2 io.ReadWriteCloser) {
 }
 
 // ==========================================
-//       HOPPING PACKET CONN
+//       HOPPING PACKET CONN (NEW)
 // ==========================================
 
+// این ساختار وظیفه دارد سوکت زیرین را بدون اینکه KCP بفهمد عوض کند
 type HoppingPacketConn struct {
 	mu          sync.RWMutex
 	activeConn  *RawTCPConn
@@ -281,9 +280,8 @@ type HoppingPacketConn struct {
 }
 
 func NewHoppingPacketConn(remoteIP string, remotePort int) (*HoppingPacketConn, error) {
+	// ایجاد اولین اتصال
 	initialPort := rand.Intn(10000) + 40000
-	
-	// اینجا کانکشن را می‌سازیم، که شامل هندشیک هم می‌شود (در NewRawTCPConn)
 	conn, err := NewRawTCPConn(initialPort, remotePort, "client", remoteIP)
 	if err != nil {
 		return nil, err
@@ -298,6 +296,7 @@ func NewHoppingPacketConn(remoteIP string, remotePort int) (*HoppingPacketConn, 
 
 func (h *HoppingPacketConn) StartRotation() {
 	for {
+		// صبر تصادفی بین Min و Max
 		waitSec := rand.Intn(hopMaxInterval-hopMinInterval) + hopMinInterval
 		time.Sleep(time.Duration(waitSec) * time.Second)
 
@@ -305,22 +304,23 @@ func (h *HoppingPacketConn) StartRotation() {
 			return
 		}
 
+		// ساخت اتصال جدید
 		newPort := rand.Intn(15000) + 35000
-		
-		// کانکشن جدید = هندشیک جدید
 		newConn, err := NewRawTCPConn(newPort, h.remotePort, "client", h.remoteIP)
 		if err != nil {
 			log.Printf("Rotation Failed: %v", err)
 			continue
 		}
 
+		// سوئیچ اتمی
 		h.mu.Lock()
 		oldConn := h.activeConn
 		h.activeConn = newConn
 		h.mu.Unlock()
 
-		log.Printf("♻️ [Hopping] Switched to Source Port: %d (Handshake Complete)", newPort)
+		log.Printf("♻️ [Hopping] Switched to Source Port: %d", newPort)
 
+		// بستن اتصال قدیمی (با کمی تاخیر برای دریافت پکت‌های در راه)
 		go func(old *RawTCPConn) {
 			time.Sleep(2 * time.Second)
 			old.Close()
@@ -339,8 +339,12 @@ func (h *HoppingPacketConn) ReadFrom(p []byte) (n int, addr net.Addr, err error)
 		}
 
 		n, addr, err = conn.ReadFrom(p)
+		
+		// اگر ارور گرفتیم، شاید بخاطر بسته شدن سوکت قدیمی موقع روتیشن باشد
+		// پس دوباره سعی می‌کنیم (مگر اینکه کلاً بسته شده باشیم)
 		if err != nil {
 			if strings.Contains(err.Error(), "closed network connection") {
+				// سوکت بسته شده، احتمالاً روتیشن رخ داده، برو از جدید بخون
 				continue
 			}
 			return n, addr, err
@@ -373,7 +377,7 @@ func (h *HoppingPacketConn) SetReadDeadline(t time.Time) error  { return nil }
 func (h *HoppingPacketConn) SetWriteDeadline(t time.Time) error { return nil }
 
 // ==========================================
-//       RAW SOCKET WITH HANDSHAKE
+//       RAW SOCKET IMPLEMENTATION
 // ==========================================
 
 type RawTCPConn struct {
@@ -382,10 +386,6 @@ type RawTCPConn struct {
 	remotePort int
 	remoteIP   net.IP
 	mode       string
-	
-	// برای هندشیک
-	seq uint32
-	ack uint32
 }
 
 func NewRawTCPConn(localPort, remotePort int, mode, remoteIPStr string) (*RawTCPConn, error) {
@@ -401,69 +401,13 @@ func NewRawTCPConn(localPort, remotePort int, mode, remoteIPStr string) (*RawTCP
 		rip = net.ParseIP(remoteIPStr)
 	}
 
-	raw := &RawTCPConn{
+	return &RawTCPConn{
 		conn:       conn,
 		localPort:  localPort,
 		remotePort: remotePort,
 		remoteIP:   rip,
 		mode:       mode,
-		seq:        rand.Uint32(),
-	}
-
-	// اگر کلاینت هستیم، هندشیک را انجام بده
-	if mode == "client" {
-		if err := raw.performHandshake(); err != nil {
-			conn.Close()
-			return nil, err
-		}
-	}
-
-	return raw, nil
-}
-
-// کلاینت: انجام هندشیک 3 مرحله‌ای
-func (c *RawTCPConn) performHandshake() error {
-	// 1. ارسال SYN
-	// log.Printf("Sending SYN from %d...", c.localPort)
-	synPacket := MakeTCPHeader(c.localPort, c.remotePort, c.seq, 0, TCP_SYN, nil)
-	if _, err := c.conn.WriteToIP(synPacket, &net.IPAddr{IP: c.remoteIP}); err != nil {
-		return err
-	}
-
-	// 2. انتظار برای SYN-ACK
-	buf := make([]byte, 1024)
-	c.conn.SetReadDeadline(time.Now().Add(3 * time.Second)) // تایم اوت کوتاه
-	defer c.conn.SetReadDeadline(time.Time{})
-
-	for {
-		n, src, err := c.conn.ReadFrom(buf)
-		if err != nil {
-			return fmt.Errorf("handshake timeout: %v", err)
-		}
-		
-		// بررسی پورت و فلگ
-		if n > 20 {
-			srcPort := binary.BigEndian.Uint16(buf[0:2])
-			dstPort := binary.BigEndian.Uint16(buf[2:4])
-			flags := buf[13]
-
-			if int(srcPort) == c.remotePort && int(dstPort) == c.localPort {
-				// چک کردن SYN-ACK (0x12)
-				if flags&TCP_SYN != 0 && flags&TCP_ACK != 0 {
-					// دریافت شد!
-					serverSeq := binary.BigEndian.Uint32(buf[4:8])
-					c.ack = serverSeq + 1
-					c.seq++
-					
-					// 3. ارسال ACK نهایی
-					// log.Printf("Got SYN-ACK, sending ACK...")
-					ackPacket := MakeTCPHeader(c.localPort, c.remotePort, c.seq, c.ack, TCP_ACK, nil)
-					c.conn.WriteToIP(ackPacket, &net.IPAddr{IP: src.(*net.IPAddr).IP})
-					return nil
-				}
-			}
-		}
-	}
+	}, nil
 }
 
 func (c *RawTCPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
@@ -475,48 +419,25 @@ func (c *RawTCPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		if err != nil {
 			return 0, nil, err
 		}
-		if n < 20 {
+		if n <= 20 {
 			continue
 		}
 
 		packetDstPort := binary.BigEndian.Uint16(buf[2:4])
 		packetSrcPort := binary.BigEndian.Uint16(buf[0:2])
-		flags := buf[13]
 
 		if int(packetDstPort) != c.localPort {
 			continue
 		}
+
+		copy(p, buf[20:n])
 
 		fakeUDPAddr := &net.UDPAddr{
 			IP:   src.(*net.IPAddr).IP,
 			Port: int(packetSrcPort),
 		}
 
-		// === SERVER HANDSHAKE LOGIC ===
-		// اگر سرور هستیم و SYN دیدیم، باید SYN-ACK بدهیم
-		if c.mode == "server" {
-			if flags&TCP_SYN != 0 {
-				// درخواست اتصال جدید است
-				clientSeq := binary.BigEndian.Uint32(buf[4:8])
-				// پاسخ SYN-ACK
-				// log.Printf("Responding to SYN from %v", src)
-				synAck := MakeTCPHeader(c.localPort, int(packetSrcPort), rand.Uint32(), clientSeq+1, TCP_SYN|TCP_ACK, nil)
-				c.conn.WriteToIP(synAck, &net.IPAddr{IP: src.(*net.IPAddr).IP})
-				continue // پکت را به لایه KCP نده
-			}
-			// اگر فقط ACK خالی بود (مرحله سوم هندشیک)، نادیده بگیر
-			if flags&TCP_ACK != 0 && n == 20 {
-				continue 
-			}
-		}
-
-		// === DATA PACKET ===
-		// فقط پکت‌های دیتا (که PSH دارند یا پیلود دارند) را برگردان
-		// معمولا KCP پکت هایش PSH دارد یا طولش > 20 است
-		if n > 20 {
-			copy(p, buf[20:n])
-			return n - 20, fakeUDPAddr, nil
-		}
+		return n - 20, fakeUDPAddr, nil
 	}
 }
 
@@ -536,40 +457,23 @@ func (c *RawTCPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 		}
 	}
 
-	// ارسال دیتا همیشه با PSH | ACK انجام می‌شود (بعد از هندشیک)
-	packet := MakeTCPHeader(c.localPort, dstPort, c.seq, c.ack, TCP_PSH|TCP_ACK, p)
-	
-	// افزایش Seq به اندازه دیتای ارسالی (اختیاری برای فیک تی سی پی)
-	// c.seq += uint32(len(p)) 
+	tcpHeader := MakeTCPHeader(c.localPort, dstPort, p)
+	packet := append(tcpHeader, p...)
 
 	_, err = c.conn.WriteToIP(packet, &net.IPAddr{IP: dstIP})
 	return len(p), err
 }
 
-// تابع ساخت هدر منعطف
-func MakeTCPHeader(srcPort, dstPort int, seq, ack uint32, flags byte, payload []byte) []byte {
-	headerLen := 20
-	totalLen := headerLen + len(payload)
-	b := make([]byte, totalLen)
-
-	binary.BigEndian.PutUint16(b[0:2], uint16(srcPort))
-	binary.BigEndian.PutUint16(b[2:4], uint16(dstPort))
-	binary.BigEndian.PutUint32(b[4:8], seq)
-	binary.BigEndian.PutUint32(b[8:12], ack)
-	
-	b[12] = 0x50 // Data Offset (5 * 4 = 20 bytes)
-	b[13] = flags
-	binary.BigEndian.PutUint16(b[14:16], 65535) // Window Size
-
-	if len(payload) > 0 {
-		copy(b[20:], payload)
-	}
-	
-	// محاسبه Checksum (اختیاری برای Raw Socket در برخی سیستم‌ها، اما بهتر است باشد)
-	// در اینجا چون کرنل معمولاً هندل می‌کند یا Raw IP است، ساده رد می‌شویم.
-	// برای واقعی‌تر شدن می‌توان Checksum فیک هم گذاشت.
-	
-	return b
+func MakeTCPHeader(srcPort, dstPort int, payload []byte) []byte {
+	h := make([]byte, 20)
+	binary.BigEndian.PutUint16(h[0:2], uint16(srcPort))
+	binary.BigEndian.PutUint16(h[2:4], uint16(dstPort))
+	binary.BigEndian.PutUint32(h[4:8], rand.Uint32())
+	binary.BigEndian.PutUint32(h[8:12], rand.Uint32())
+	h[12] = 0x50 
+	h[13] = 0x18 
+	binary.BigEndian.PutUint16(h[14:16], 65535) 
+	return h
 }
 
 func (c *RawTCPConn) Close() error                       { return c.conn.Close() }
