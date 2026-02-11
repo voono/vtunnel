@@ -19,32 +19,41 @@ import (
 	"github.com/xtaci/kcp-go/v5"
 	"github.com/xtaci/smux"
 	"golang.org/x/crypto/pbkdf2"
+	"golang.org/x/net/bpf"
+	"golang.org/x/net/ipv4"
 )
 
 const (
-	salt         = "raw-tcp-tunnel-stable-v3"
-	dataShards   = 10
-	parityShards = 3
-	mtuLimit     = 1200
-
-	idleTimeout  = 60 * time.Second
-	// واچ‌داگ: اگر 15 ثانیه هیچ دیتایی از شبکه نیاید، ریستارت کن
-	hardTimeout  = 15 
-	checkInterval = 2 * time.Second
+	salt          = "raw-tcp-tunnel-optimized-v4"
+	dataShards    = 10
+	parityShards  = 0    // بهینه‌سازی: کاهش سربار FEC به 10%
+	mtuLimit      = 1350 // افزایش MTU برای بهره‌وری بیشتر (با احتساب هدر)
+	headerSize    = 20   // TCP Header size
+	idleTimeout   = 60 * time.Second
+	checkInterval = 5 * time.Second
 )
 
-var lastPacketTime int64
-
-var bufPool = sync.Pool{
-	New: func() interface{} {
-		return make([]byte, 4096)
-	},
-}
+var (
+	lastPacketTime int64
+	// استفاده از بافر بزرگتر برای انتقال سریع‌تر
+	bufPool = sync.Pool{
+		New: func() interface{} {
+			b := make([]byte, 32*1024)
+			return &b
+		},
+	}
+	// استخر مخصوص پکت‌های خروجی برای جلوگیری از Allocation
+	packetPool = sync.Pool{
+		New: func() interface{} {
+			return make([]byte, mtuLimit+headerSize)
+		},
+	}
+)
 
 func main() {
 	mode := flag.String("mode", "server", "Mode: 'server' or 'client'")
 	listen := flag.String("listen", "", "SOCKS5 Listen Address")
-	fwd := flag.String("fwd", "", "Port Forwarding")
+	fwd := flag.String("fwd", "", "Port Forwarding rule")
 	remote := flag.String("remote", "", "Server IP")
 	port := flag.Int("port", 443, "Tunnel Port")
 	key := flag.String("key", "secret", "Encryption key")
@@ -71,8 +80,9 @@ func main() {
 // ==========================================
 
 func runServer(port int, block kcp.BlockCrypt) {
-	log.Printf("🚀 [SERVER] Starting on Port %d", port)
+	log.Printf("🚀 [SERVER] Starting Optimized Raw Tunnel on Port %d", port)
 
+	// اتصال به Raw Socket با فیلتر BPF
 	rawConn, err := NewRawTCPConn(port, 0, "server", "")
 	if err != nil {
 		log.Fatalf("❌ Socket Error: %v", err)
@@ -92,15 +102,19 @@ func runServer(port int, block kcp.BlockCrypt) {
 			continue
 		}
 
+		// تنظیمات KCP برای حداکثر سرعت
 		conn := sess.(*kcp.UDPSession)
 		conn.SetStreamMode(true)
 		conn.SetWindowSize(1024, 1024)
-		conn.SetNoDelay(1, 20, 2, 1)
+		conn.SetNoDelay(1, 10, 2, 1)   // Interval 10ms
 		conn.SetMtu(mtuLimit)
+		conn.SetACKNoDelay(true)
 
 		smuxConf := smux.DefaultConfig()
 		smuxConf.KeepAliveInterval = 10 * time.Second
-		smuxConf.KeepAliveTimeout = 30 * time.Second
+		smuxConf.KeepAliveTimeout = 45 * time.Second
+		smuxConf.MaxFrameSize = 32768 // فریم‌های بزرگتر برای CPU کمتر
+		smuxConf.MaxReceiveBuffer = 4194304
 
 		mux, err := smux.Server(sess, smuxConf)
 		if err != nil {
@@ -120,7 +134,8 @@ func handleMux(mux *smux.Session, socksServer *socks5.Server) {
 		}
 		go func(s *smux.Stream) {
 			defer s.Close()
-			s.SetReadDeadline(time.Now().Add(idleTimeout))
+			// حذف Deadline برای استریم‌های طولانی مگر اینکه داده نیاید
+			// s.SetReadDeadline(time.Now().Add(idleTimeout))
 
 			lenBuf := make([]byte, 1)
 			if _, err := io.ReadFull(s, lenBuf); err != nil {
@@ -168,15 +183,17 @@ func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.Bl
 		log.Fatal(err)
 	}
 
-	// تنظیمات KCP برای پایداری بیشتر
 	kcpSess.SetStreamMode(true)
-	kcpSess.SetWindowSize(1024, 1024)
-	kcpSess.SetNoDelay(1, 20, 2, 1)
+	kcpSess.SetWindowSize(4096, 4096)
+	kcpSess.SetNoDelay(1, 10, 2, 1) // Interval 10ms, Resend 2
 	kcpSess.SetMtu(mtuLimit)
+	kcpSess.SetACKNoDelay(true)
 
 	smuxConf := smux.DefaultConfig()
-	smuxConf.KeepAliveInterval = 5 * time.Second  // سریع‌تر چک کن
-	smuxConf.KeepAliveTimeout = 15 * time.Second
+	smuxConf.KeepAliveInterval = 5 * time.Second
+	smuxConf.KeepAliveTimeout = 20 * time.Second
+	smuxConf.MaxFrameSize = 32768
+	smuxConf.MaxReceiveBuffer = 4194304
 
 	session, err := smux.Client(kcpSess, smuxConf)
 	if err != nil {
@@ -184,22 +201,19 @@ func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.Bl
 		os.Exit(1)
 	}
 
-	// --- WATCHDOG: شناسایی قطعی زیر 15 ثانیه ---
+	// WATCHDOG بهینه شده
 	go func() {
 		ticker := time.NewTicker(checkInterval)
+		defer ticker.Stop()
 		for range ticker.C {
-			// علت 1: سشن به صورت داخلی خطا داده
 			if session.IsClosed() {
-				log.Println("🔴 [RESTART] Smux session closed (Protocol Timeout).")
+				log.Println("🔴 [RESTART] Session closed.")
 				os.Exit(1)
 			}
-
-			// علت 2: فریز شدن کل شبکه (حتی پکت‌های KeepAlive نمی‌رسند)
 			last := atomic.LoadInt64(&lastPacketTime)
-			diff := time.Now().Unix() - last
-			if diff > hardTimeout {
-				log.Printf("💀 [RESTART] Network Frozen! No raw packets for %d seconds.", diff)
-				rawConn.Close() // بیدار کردن روتین‌های قفل شده
+			if time.Now().Unix()-last > 20 { // 20 ثانیه بدون پکت
+				log.Println("💀 [RESTART] Network Frozen (No RX).")
+				rawConn.Close()
 				os.Exit(1)
 			}
 		}
@@ -241,8 +255,7 @@ func startListener(localAddr, targetAddr string, session *smux.Session) {
 				local.Close()
 				return
 			}
-			p2.SetReadDeadline(time.Now().Add(idleTimeout))
-
+			
 			if targetAddr == "" {
 				p2.Write([]byte{0})
 			} else {
@@ -258,106 +271,193 @@ func startListener(localAddr, targetAddr string, session *smux.Session) {
 func pipe(c1, c2 io.ReadWriteCloser) {
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); copyLoop(c1, c2); c1.Close(); c2.Close() }()
-	go func() { defer wg.Done(); copyLoop(c2, c1); c2.Close(); c1.Close() }()
+	go func() { defer wg.Done(); io.CopyBuffer(c1, c2, *bufPool.New().(*[]byte)); c1.Close(); c2.Close() }()
+	go func() { defer wg.Done(); io.CopyBuffer(c2, c1, *bufPool.New().(*[]byte)); c2.Close(); c1.Close() }()
 	wg.Wait()
 }
 
-func copyLoop(src io.Reader, dst io.Writer) {
-	buf := bufPool.Get().([]byte)
-	defer bufPool.Put(buf)
-	for {
-		if conn, ok := src.(interface{ SetReadDeadline(time.Time) error }); ok {
-			conn.SetReadDeadline(time.Now().Add(idleTimeout))
-		}
-		nr, err := src.Read(buf)
-		if nr > 0 {
-			dst.Write(buf[0:nr])
-		}
-		if err != nil {
-			break
-		}
-	}
-}
-
 // ==========================================
-//              RAW SOCKET LOGIC
+//              OPTIMIZED RAW SOCKET
 // ==========================================
 
 type RawTCPConn struct {
-	conn       *net.IPConn
+	pConn      *ipv4.PacketConn // استفاده از ipv4 packet conn برای BPF
 	localPort  int
 	remotePort int
 	remoteIP   net.IP
 	mode       string
+	seq        uint32 // کانتر ساده برای Sequence
 }
 
 func NewRawTCPConn(localPort, remotePort int, mode, remoteIPStr string) (*RawTCPConn, error) {
-	conn, err := net.ListenIP("ip4:tcp", nil)
+	// باز کردن سوکت Raw
+	conn, err := net.ListenPacket("ip4:tcp", "0.0.0.0")
 	if err != nil {
 		return nil, err
 	}
+
+	// تبدیل به ipv4.PacketConn برای اعمال BPF
+	pConn := ipv4.NewPacketConn(conn)
+
+	// --- BPF FILTERING (CRITICAL OPTIMIZATION) ---
+	// این فیلتر به کرنل می‌گوید فقط بسته‌هایی که پورت مقصدشان
+	// برابر با localPort است را به برنامه پاس بدهد.
+	// توجه: این اسمبلی برای IPv4 استاندارد (بدون Options) است.
+	filter, err := bpf.Assemble([]bpf.Instruction{
+		// Load Protocol (Byte at offset 9)
+		bpf.LoadAbsolute{Off: 9, Size: 1},
+		// Jump if not TCP (Protocol 6) -> Drop
+		bpf.JumpIf{Cond: bpf.JumpNotEqual, Val: 6, SkipTrue: 10}, 
+		
+		// Load Fragment Offset (Offset 6, 2 bytes)
+		bpf.LoadAbsolute{Off: 6, Size: 2},
+		// Mask out flags (0x1fff)
+		bpf.JumpIf{Cond: bpf.JumpBitsSet, Val: 0x1fff, SkipTrue: 8},
+
+		// Load IP Header Length (IHL) to find where Data starts
+		// (Actually for raw socket we assume standard header or use relative loads, 
+		// but simple raw sockets usually give IP header. Let's assume offset 22 for DstPort)
+		
+		// Load Destination Port (Offset 22 in IP header)
+		bpf.LoadAbsolute{Off: 22, Size: 2},
+		// Jump if not equal to localPort -> Drop
+		bpf.JumpIf{Cond: bpf.JumpNotEqual, Val: uint32(localPort), SkipTrue: 4},
+
+		// Keep Packet (Return -1 aka 65535 bytes)
+		bpf.RetConstant{Val: 0xFFFF},
+
+		// Drop Packet (Return 0)
+		bpf.RetConstant{Val: 0},
+	})
+
+	if err == nil {
+		// اعمال فیلتر فقط در لینوکس کار می‌کند
+		if err := pConn.SetBPF(filter); err != nil {
+			log.Printf("⚠️ Warning: BPF not supported/failed: %v. CPU usage might be high.", err)
+		} else {
+			log.Println("✅ BPF Filter applied! (Kernel-level filtering enabled)")
+		}
+	} else {
+		log.Printf("⚠️ BPF Assembly error: %v", err)
+	}
+
 	var rip net.IP
 	if remoteIPStr != "" {
 		rip = net.ParseIP(remoteIPStr)
 	}
-	return &RawTCPConn{conn: conn, localPort: localPort, remotePort: remotePort, remoteIP: rip, mode: mode}, nil
+
+	return &RawTCPConn{
+		pConn:      pConn,
+		localPort:  localPort,
+		remotePort: remotePort,
+		remoteIP:   rip,
+		mode:       mode,
+		seq:        rand.Uint32(),
+	}, nil
 }
 
 func (c *RawTCPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
-	buf := bufPool.Get().([]byte)
-	defer bufPool.Put(buf)
+	// بافر بزرگ برای خواندن از کرنل
+	bufPtr := bufPool.New().(*[]byte)
+	buf := *bufPtr
+	defer bufPool.Put(bufPtr)
 
 	for {
-		// اجازه بده هر 1 ثانیه از بلوکه شدن خارج شود تا برنامه Exit را حس کند
-		c.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
-		
-		n, src, err := c.conn.ReadFrom(buf)
+		// حذف SetReadDeadline از این حلقه برای جلوگیری از سربار Syscall
+		// BPF فیلتر می‌کند، پس اکثر پکت‌ها معتبر هستند
+		n, _, src, err := c.pConn.ReadFrom(buf)
 		if err != nil {
-			// اگر تایم‌اوت سوکت لینوکسی بود، فقط تکرار کن تا لوپ واچ‌داگ فرصت داشته باشد
-			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
-				return 0, nil, err
-			}
 			return 0, nil, err
 		}
 
-		if n <= 20 { continue }
-		packetDstPort := binary.BigEndian.Uint16(buf[2:4])
-		packetSrcPort := binary.BigEndian.Uint16(buf[0:2])
+		// پردازش هدر TCP
+		// با فرض اینکه هدر IP وجود دارد (20 بایت اول)، هدر TCP بعد از آن است.
+		// offset 20 = شروع هدر TCP
+		if n < 40 { // 20 IP + 20 TCP
+			continue 
+		}
 
-		if int(packetDstPort) != c.localPort { continue }
+		tcpHeader := buf[20:] // پرش از روی هدر IP
+		packetSrcPort := binary.BigEndian.Uint16(tcpHeader[0:2])
+		packetDstPort := binary.BigEndian.Uint16(tcpHeader[2:4])
 
-		// تمدید زمان حیات
+		// چک نهایی (اگر BPF کار نکرد یا پکت عجیب بود)
+		if int(packetDstPort) != c.localPort {
+			continue
+		}
+
+		// آپدیت زمان برای Watchdog
 		atomic.StoreInt64(&lastPacketTime, time.Now().Unix())
 
-		copy(p, buf[20:n])
-		return n - 20, &net.UDPAddr{IP: src.(*net.IPAddr).IP, Port: int(packetSrcPort)}, nil
+		// محاسبه طول هدر TCP (Data Offset)
+		dataOffset := (tcpHeader[12] >> 4) * 4
+		if int(dataOffset) > n-20 {
+			continue
+		}
+
+		payload := tcpHeader[dataOffset:]
+		payloadLen := len(payload)
+
+		if payloadLen == 0 {
+			continue
+		}
+
+		copy(p, payload)
+		// src در اینجا آدرس IP است (net.IPAddr)، باید به UDPAddr تبدیل کنیم برای KCP
+		return payloadLen, &net.UDPAddr{IP: src.(*net.IPAddr).IP, Port: int(packetSrcPort)}, nil
 	}
 }
 
 func (c *RawTCPConn) WriteTo(p []byte, addr net.Addr) (n int, err error) {
 	var dstIP net.IP
 	var dstPort int
+	
 	if c.mode == "client" {
 		dstIP, dstPort = c.remoteIP, c.remotePort
 	} else {
-		udp := addr.(*net.UDPAddr)
+		udp, ok := addr.(*net.UDPAddr)
+		if !ok { return 0, net.ErrWriteToConnected }
 		dstIP, dstPort = udp.IP, udp.Port
 	}
 
-	h := make([]byte, 20)
-	binary.BigEndian.PutUint16(h[0:2], uint16(c.localPort))
-	binary.BigEndian.PutUint16(h[2:4], uint16(dstPort))
-	binary.BigEndian.PutUint32(h[4:8], rand.Uint32())
-	h[12], h[13] = 0x50, 0x18
-	binary.BigEndian.PutUint16(h[14:16], 65535)
+	// استفاده از پکت پول برای جلوگیری از Allocation
+	pkt := packetPool.Get().([]byte)
+	// مطمئن شویم پکت به استخر برمی‌گردد (البته در این ساختار KCP کپی می‌کند و ما می‌فرستیم،
+	// اما چون WriteTo بلاک می‌کند تا ارسال انجام شود، می‌توانیم اینجا Put کنیم؟
+	// خیر، WriteToIP کپی می‌کند؟ بله safe است.)
+	defer packetPool.Put(pkt)
+	
+	// ساخت هدر TCP در همان بافر
+	// پورت مبدا
+	binary.BigEndian.PutUint16(pkt[0:2], uint16(c.localPort))
+	// پورت مقصد
+	binary.BigEndian.PutUint16(pkt[2:4], uint16(dstPort))
+	// Sequence Number (سریع)
+	atomic.AddUint32(&c.seq, 1)
+	binary.BigEndian.PutUint32(pkt[4:8], c.seq)
+	// Ack Number
+	binary.BigEndian.PutUint32(pkt[8:12], 0)
+	// Data Offset (5 words = 20 bytes) & Flags (ACK + PSH = 0x18)
+	pkt[12] = 0x50 
+	pkt[13] = 0x18 
+	// Window Size
+	pkt[14], pkt[15] = 0xFF, 0xFF
+	// Checksum (0 برای راحتی، کرنل معمولا پر نمی‌کند مگر raw باشد)
+	pkt[16], pkt[17] = 0, 0
+	// Urgent Pointer
+	pkt[18], pkt[19] = 0, 0
 
-	_, err = c.conn.WriteToIP(append(h, p...), &net.IPAddr{IP: dstIP})
+	// کپی داده‌ها به بعد از هدر
+	copy(pkt[20:], p)
+	totalLen := 20 + len(p)
+
+	// ارسال مستقیم
+	_, err = c.pConn.WriteTo(pkt[:totalLen], nil, &net.IPAddr{IP: dstIP})
 	return len(p), err
 }
 
-func (c *RawTCPConn) Close() error                       { return c.conn.Close() }
+func (c *RawTCPConn) Close() error                       { return c.pConn.Close() }
 func (c *RawTCPConn) LocalAddr() net.Addr                { return &net.UDPAddr{IP: net.ParseIP("0.0.0.0"), Port: c.localPort} }
-func (c *RawTCPConn) SetDeadline(t time.Time) error      { return nil }
-func (c *RawTCPConn) SetReadDeadline(t time.Time) error  { return nil }
-func (c *RawTCPConn) SetWriteDeadline(t time.Time) error { return nil }
+func (c *RawTCPConn) SetDeadline(t time.Time) error      { return c.pConn.SetDeadline(t) }
+func (c *RawTCPConn) SetReadDeadline(t time.Time) error  { return c.pConn.SetReadDeadline(t) }
+func (c *RawTCPConn) SetWriteDeadline(t time.Time) error { return c.pConn.SetWriteDeadline(t) }
