@@ -93,8 +93,17 @@ func runServer(port int, block kcp.BlockCrypt) {
 
 		conn := sess.(*kcp.UDPSession)
 		conn.SetStreamMode(true)
-		conn.SetWindowSize(4096, 4096)
-		conn.SetNoDelay(1, 10, 2, 1)
+		// 2. کاهش پنجره ارسال (مهمترین تغییر)
+		// از 4096 به 1024 (یا حتی 512 اگر تعداد کاربر خیلی زیاد شد)
+		// 3. تنظیمات NoDelay متعادل
+		// nodelay: 1 (روشن)
+		// interval: 20 (از 10 به 20 تغییر بده تا CPU و شبکه نفس بکشن)
+		// resend: 1 (از 2 به 1 تغییر بده تا الکی پکت تکراری نفرسته)
+		// nc: 1 (همچنان Congestion Control خاموش باشه تا سرعت افت نکنه)
+		conn.SetNoDelay(1, 20, 1, 1)
+
+		// 4. بقیه تنظیمات (بدون تغییر)
+		conn.SetWindowSize(1024, 1024)
 		conn.SetACKNoDelay(true)
 		conn.SetMtu(mtuLimit)
 
