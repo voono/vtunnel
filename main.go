@@ -12,7 +12,6 @@ import (
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/armon/go-socks5"
@@ -22,18 +21,13 @@ import (
 )
 
 const (
-	salt         = "raw-tcp-tunnel-stable-v3"
+	salt         = "raw-tcp-tunnel-stable-v4"
 	dataShards   = 10
-	parityShards = 3
-	mtuLimit     = 1200
-
-	idleTimeout  = 60 * time.Second
-	// واچ‌داگ: اگر 15 ثانیه هیچ دیتایی از شبکه نیاید، ریستارت کن
-	hardTimeout  = 15 
-	checkInterval = 2 * time.Second
+	parityShards = 0
+	mtuLimit     = 1350
+	idleTimeout   = 60 * time.Second
+	checkInterval = 5 * time.Second
 )
-
-var lastPacketTime int64
 
 var bufPool = sync.Pool{
 	New: func() interface{} {
@@ -51,7 +45,6 @@ func main() {
 	flag.Parse()
 
 	rand.Seed(time.Now().UnixNano())
-	atomic.StoreInt64(&lastPacketTime, time.Now().Unix())
 
 	pass := pbkdf2.Key([]byte(*key), []byte(salt), 4096, 32, sha1.New)
 	block, _ := kcp.NewAESBlockCrypt(pass)
@@ -94,13 +87,16 @@ func runServer(port int, block kcp.BlockCrypt) {
 
 		conn := sess.(*kcp.UDPSession)
 		conn.SetStreamMode(true)
-		conn.SetWindowSize(1024, 1024)
-		conn.SetNoDelay(1, 20, 2, 1)
+		conn.SetWindowSize(4096, 4096)
+		conn.SetNoDelay(1, 10, 2, 1)
 		conn.SetMtu(mtuLimit)
+		conn.SetACKNoDelay(true)
 
 		smuxConf := smux.DefaultConfig()
 		smuxConf.KeepAliveInterval = 10 * time.Second
 		smuxConf.KeepAliveTimeout = 30 * time.Second
+		smuxConf.MaxFrameSize = 32768
+		smuxConf.MaxReceiveBuffer = 4194304
 
 		mux, err := smux.Server(sess, smuxConf)
 		if err != nil {
@@ -170,13 +166,16 @@ func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.Bl
 
 	// تنظیمات KCP برای پایداری بیشتر
 	kcpSess.SetStreamMode(true)
-	kcpSess.SetWindowSize(1024, 1024)
-	kcpSess.SetNoDelay(1, 20, 2, 1)
+	kcpSess.SetWindowSize(4096, 4096)
+	kcpSess.SetNoDelay(1, 10, 2, 1)
 	kcpSess.SetMtu(mtuLimit)
+	kcpSess.SetACKNoDelay(true)
 
 	smuxConf := smux.DefaultConfig()
-	smuxConf.KeepAliveInterval = 5 * time.Second  // سریع‌تر چک کن
+	smuxConf.KeepAliveInterval = 5 * time.Second
 	smuxConf.KeepAliveTimeout = 15 * time.Second
+	smuxConf.MaxFrameSize = 32768
+	smuxConf.MaxReceiveBuffer = 4194304
 
 	session, err := smux.Client(kcpSess, smuxConf)
 	if err != nil {
@@ -184,22 +183,12 @@ func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.Bl
 		os.Exit(1)
 	}
 
-	// --- WATCHDOG: شناسایی قطعی زیر 15 ثانیه ---
+	// --- WATCHDOG: ریستارت فقط وقتی سشن smux بسته شده ---
 	go func() {
 		ticker := time.NewTicker(checkInterval)
 		for range ticker.C {
-			// علت 1: سشن به صورت داخلی خطا داده
 			if session.IsClosed() {
 				log.Println("🔴 [RESTART] Smux session closed (Protocol Timeout).")
-				os.Exit(1)
-			}
-
-			// علت 2: فریز شدن کل شبکه (حتی پکت‌های KeepAlive نمی‌رسند)
-			last := atomic.LoadInt64(&lastPacketTime)
-			diff := time.Now().Unix() - last
-			if diff > hardTimeout {
-				log.Printf("💀 [RESTART] Network Frozen! No raw packets for %d seconds.", diff)
-				rawConn.Close() // بیدار کردن روتین‌های قفل شده
 				os.Exit(1)
 			}
 		}
@@ -326,9 +315,6 @@ func (c *RawTCPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 		packetSrcPort := binary.BigEndian.Uint16(buf[0:2])
 
 		if int(packetDstPort) != c.localPort { continue }
-
-		// تمدید زمان حیات
-		atomic.StoreInt64(&lastPacketTime, time.Now().Unix())
 
 		copy(p, buf[20:n])
 		return n - 20, &net.UDPAddr{IP: src.(*net.IPAddr).IP, Port: int(packetSrcPort)}, nil
