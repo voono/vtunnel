@@ -24,7 +24,7 @@ const (
 	salt         = "raw-tcp-tunnel-stable-v4"
 	dataShards   = 10
 	parityShards = 0
-	mtuLimit     = 1350
+	mtuLimit     = 1200
 	idleTimeout   = 60 * time.Second
 	checkInterval = 5 * time.Second
 )
@@ -94,7 +94,7 @@ func runServer(port int, block kcp.BlockCrypt) {
 
 		smuxConf := smux.DefaultConfig()
 		smuxConf.KeepAliveInterval = 10 * time.Second
-		smuxConf.KeepAliveTimeout = 30 * time.Second
+		smuxConf.KeepAliveTimeout = 15 * time.Second
 		smuxConf.MaxFrameSize = 32768
 		smuxConf.MaxReceiveBuffer = 4194304
 
