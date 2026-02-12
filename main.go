@@ -23,7 +23,7 @@ import (
 const (
 	salt         = "raw-tcp-tunnel-stable-v4"
 	dataShards   = 10
-	parityShards = 0
+	parityShards = 3
 	mtuLimit     = 1200
 	idleTimeout   = 60 * time.Second
 	checkInterval = 5 * time.Second
@@ -93,7 +93,7 @@ func runServer(port int, block kcp.BlockCrypt) {
 		conn.SetACKNoDelay(true)
 
 		smuxConf := smux.DefaultConfig()
-		smuxConf.KeepAliveInterval = 10 * time.Second
+		smuxConf.KeepAliveInterval = 5 * time.Second
 		smuxConf.KeepAliveTimeout = 15 * time.Second
 		smuxConf.MaxFrameSize = 32768
 		smuxConf.MaxReceiveBuffer = 4194304
@@ -286,6 +286,11 @@ func NewRawTCPConn(localPort, remotePort int, mode, remoteIPStr string) (*RawTCP
 	if err != nil {
 		return nil, err
 	}
+	
+	// افزایش بافر سیستم عامل به ۴ مگابایت برای جلوگیری از دراپ شدن پکت‌ها
+	conn.SetReadBuffer(4 * 1024 * 1024)
+	conn.SetWriteBuffer(4 * 1024 * 1024)
+
 	var rip net.IP
 	if remoteIPStr != "" {
 		rip = net.ParseIP(remoteIPStr)
