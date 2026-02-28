@@ -10,6 +10,7 @@ import (
 	"math/rand"
 	"net"
 	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +26,7 @@ const (
 	dataShards   = 10
 	parityShards = 3
 	mtuLimit     = 1200
-	idleTimeout   = 60 * time.Second
+	idleTimeout  = 60 * time.Second
 	checkInterval = 5 * time.Second
 )
 
@@ -38,7 +39,8 @@ var bufPool = sync.Pool{
 func main() {
 	mode := flag.String("mode", "server", "Mode: 'server' or 'client'")
 	listen := flag.String("listen", "", "SOCKS5 Listen Address")
-	fwd := flag.String("fwd", "", "Port Forwarding")
+	fwd := flag.String("fwd", "", "Local Port Forwarding (e.g. 8080:target:80)")
+	rev := flag.String("rev", "", "Reverse Port Forwarding (e.g. 8080:127.0.0.1:80)")
 	remote := flag.String("remote", "", "Server IP")
 	port := flag.Int("port", 443, "Tunnel Port")
 	key := flag.String("key", "secret", "Encryption key")
@@ -55,7 +57,7 @@ func main() {
 		if *remote == "" {
 			log.Fatal("❌ Client mode requires -remote <IP>")
 		}
-		runClient(*listen, *fwd, *remote, *port, block)
+		runClient(*listen, *fwd, *rev, *remote, *port, block)
 	}
 }
 
@@ -124,11 +126,71 @@ func handleMux(mux *smux.Session, socksServer *socks5.Server) {
 			}
 			addrLen := int(lenBuf[0])
 
+			// Magic Byte 255: Reverse Tunnel Control Stream
+			if addrLen == 255 {
+				s.SetReadDeadline(time.Time{}) // Disable deadline for control stream
+
+				portBuf := make([]byte, 2)
+				if _, err := io.ReadFull(s, portBuf); err != nil {
+					return
+				}
+				port := binary.BigEndian.Uint16(portBuf)
+
+				tLenBuf := make([]byte, 1)
+				if _, err := io.ReadFull(s, tLenBuf); err != nil {
+					return
+				}
+				tLen := int(tLenBuf[0])
+				tBuf := make([]byte, tLen)
+				if _, err := io.ReadFull(s, tBuf); err != nil {
+					return
+				}
+				targetAddr := string(tBuf)
+
+				log.Printf("🔄 [SERVER] Reverse tunnel setup requested on port %d -> %s", port, targetAddr)
+
+				ln, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+				if err != nil {
+					log.Printf("❌ Failed to listen for reverse tunnel on %d: %v", port, err)
+					return
+				}
+				defer ln.Close()
+
+				// Monitor the control stream; if the client closes it, close the listener
+				go func() {
+					io.Copy(io.Discard, s)
+					ln.Close()
+				}()
+
+				for {
+					conn, err := ln.Accept()
+					if err != nil {
+						break
+					}
+					go func(c net.Conn) {
+						defer c.Close()
+						revStream, err := mux.OpenStream()
+						if err != nil {
+							return
+						}
+						defer revStream.Close()
+
+						// Tell client where to route this locally
+						revStream.Write([]byte{byte(len(targetAddr))})
+						revStream.Write([]byte(targetAddr))
+						pipe(c, revStream)
+					}(conn)
+				}
+				return
+			}
+
+			// 0: SOCKS5 Request
 			if addrLen == 0 {
 				socksServer.ServeConn(s)
 				return
 			}
 
+			// >0: Direct Forward Request
 			addrBuf := make([]byte, addrLen)
 			if _, err := io.ReadFull(s, addrBuf); err != nil {
 				return
@@ -150,7 +212,7 @@ func handleMux(mux *smux.Session, socksServer *socks5.Server) {
 //              CLIENT LOGIC
 // ==========================================
 
-func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.BlockCrypt) {
+func runClient(socksAddr, fwdRule, revRule, remoteIP string, remotePort int, block kcp.BlockCrypt) {
 	localSrcPort := rand.Intn(10000) + 50000
 	log.Printf("🚀 [CLIENT] Connecting to %s:%d (Local Port: %d)", remoteIP, remotePort, localSrcPort)
 
@@ -164,7 +226,6 @@ func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.Bl
 		log.Fatal(err)
 	}
 
-	// تنظیمات KCP برای پایداری بیشتر
 	kcpSess.SetStreamMode(true)
 	kcpSess.SetWindowSize(4096, 4096)
 	kcpSess.SetNoDelay(1, 10, 2, 1)
@@ -183,7 +244,7 @@ func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.Bl
 		os.Exit(1)
 	}
 
-	// --- WATCHDOG: ریستارت فقط وقتی سشن smux بسته شده ---
+	// Watchdog
 	go func() {
 		ticker := time.NewTicker(checkInterval)
 		for range ticker.C {
@@ -191,6 +252,40 @@ func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.Bl
 				log.Println("🔴 [RESTART] Smux session closed (Protocol Timeout).")
 				os.Exit(1)
 			}
+		}
+	}()
+
+	// Handle incoming streams from the Server (used for Reverse Tunneling)
+	go func() {
+		for {
+			stream, err := session.AcceptStream()
+			if err != nil {
+				return
+			}
+			go func(s *smux.Stream) {
+				defer s.Close()
+				s.SetReadDeadline(time.Now().Add(idleTimeout))
+
+				lenBuf := make([]byte, 1)
+				if _, err := io.ReadFull(s, lenBuf); err != nil {
+					return
+				}
+				tLen := int(lenBuf[0])
+				tBuf := make([]byte, tLen)
+				if _, err := io.ReadFull(s, tBuf); err != nil {
+					return
+				}
+				targetAddr := string(tBuf)
+
+				localConn, err := net.DialTimeout("tcp", targetAddr, 5*time.Second)
+				if err != nil {
+					log.Printf("❌ Reverse dial failed to %s: %v", targetAddr, err)
+					return
+				}
+				defer localConn.Close()
+
+				pipe(s, localConn)
+			}(stream)
 		}
 	}()
 
@@ -208,7 +303,46 @@ func runClient(socksAddr, fwdRule, remoteIP string, remotePort int, block kcp.Bl
 		}
 	}
 
+	// Setup Reverse Tunnels
+	if revRule != "" {
+		rules := strings.Split(revRule, ",")
+		for _, rule := range rules {
+			parts := strings.SplitN(rule, ":", 2)
+			if len(parts) == 2 {
+				port, err := strconv.Atoi(parts[0])
+				if err == nil {
+					go setupReverseTunnel(session, uint16(port), parts[1])
+				}
+			}
+		}
+	}
+
 	select {}
+}
+
+func setupReverseTunnel(session *smux.Session, remotePort uint16, targetAddr string) {
+	log.Printf("📡 [REVERSE] Telling server to listen on port %d -> forwarding to local %s", remotePort, targetAddr)
+	
+	s, err := session.OpenStream()
+	if err != nil {
+		log.Printf("❌ Reverse tunnel setup failed: %v", err)
+		return
+	}
+	
+	// Payload format: [255 (magic)] [remote port (2 bytes)] [target length (1 byte)] [target addr string]
+	s.Write([]byte{255})
+	
+	portBuf := make([]byte, 2)
+	binary.BigEndian.PutUint16(portBuf, remotePort)
+	s.Write(portBuf)
+
+	addrBytes := []byte(targetAddr)
+	s.Write([]byte{byte(len(addrBytes))})
+	s.Write(addrBytes)
+
+	// Keep stream open. If it closes, the server stops listening on that port.
+	io.Copy(io.Discard, s)
+	log.Printf("🔴 [REVERSE] Tunnel for %d closed", remotePort)
 }
 
 func startListener(localAddr, targetAddr string, session *smux.Session) {
@@ -287,7 +421,6 @@ func NewRawTCPConn(localPort, remotePort int, mode, remoteIPStr string) (*RawTCP
 		return nil, err
 	}
 	
-	// افزایش بافر سیستم عامل به ۴ مگابایت برای جلوگیری از دراپ شدن پکت‌ها
 	conn.SetReadBuffer(4 * 1024 * 1024)
 	conn.SetWriteBuffer(4 * 1024 * 1024)
 
@@ -303,12 +436,10 @@ func (c *RawTCPConn) ReadFrom(p []byte) (n int, addr net.Addr, err error) {
 	defer bufPool.Put(buf)
 
 	for {
-		// اجازه بده هر 1 ثانیه از بلوکه شدن خارج شود تا برنامه Exit را حس کند
 		c.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
 		
 		n, src, err := c.conn.ReadFrom(buf)
 		if err != nil {
-			// اگر تایم‌اوت سوکت لینوکسی بود، فقط تکرار کن تا لوپ واچ‌داگ فرصت داشته باشد
 			if nerr, ok := err.(net.Error); ok && nerr.Timeout() {
 				return 0, nil, err
 			}
