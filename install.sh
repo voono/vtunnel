@@ -151,9 +151,9 @@ function add_tunnel() {
             SOCKS_ARG="-listen $LOC_SOCKS"
         fi
 
-        # Forwarding
+        # Forwarding (Local to Remote)
         FWD_ARG=""
-        read_with_default "Enable Port Forwarding? (y/n)" "n" ENABLE_FWD
+        read_with_default "Enable Local Port Forwarding? (y/n)" "n" ENABLE_FWD
         if [[ "$ENABLE_FWD" =~ ^[Yy]$ ]]; then
             echo -e "${YELLOW}Format: LocalPort:RemoteIP:RemotePort${NC}"
             read_with_default "Forward Rule" "" LOC_FWD
@@ -162,7 +162,18 @@ function add_tunnel() {
             fi
         fi
 
-        CMD_ARGS="-mode client -remote $REMOTE_IP -port $T_PORT $SOCKS_ARG $FWD_ARG -key \"$T_KEY\""
+        # Reverse Forwarding (Remote to Local)
+        REV_ARG=""
+        read_with_default "Enable Reverse Port Forwarding? (y/n)" "n" ENABLE_REV
+        if [[ "$ENABLE_REV" =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}Format: RemotePort:LocalIP:LocalPort (e.g., 8080:127.0.0.1:80)${NC}"
+            read_with_default "Reverse Rule" "" REV_RULE
+            if [[ -n "$REV_RULE" ]]; then
+               REV_ARG="-rev \"$REV_RULE\""
+            fi
+        fi
+
+        CMD_ARGS="-mode client -remote $REMOTE_IP -port $T_PORT $SOCKS_ARG $FWD_ARG $REV_ARG -key \"$T_KEY\""
         IPTABLES_RULE="/sbin/iptables -A OUTPUT -p tcp --tcp-flags RST RST -j DROP"
         IPTABLES_CLEAN="/sbin/iptables -D OUTPUT -p tcp --tcp-flags RST RST -j DROP"
     else
